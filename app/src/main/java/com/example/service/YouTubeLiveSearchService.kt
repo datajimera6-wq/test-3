@@ -43,6 +43,15 @@ class YouTubeLiveSearchService : AccessibilityService() {
         var isServiceConnected: Boolean = false
             private set
 
+        fun closeCurrentCommentOrChatSheet(): Boolean {
+            val srv = instance ?: return false
+            return try {
+                srv.performGlobalAction(GLOBAL_ACTION_BACK)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
         @Volatile
         var isYouTubeInForeground: Boolean = false
 
@@ -2770,21 +2779,27 @@ class YouTubeLiveSearchService : AccessibilityService() {
 
     @Volatile
     private var lastReportedCommentSheetState: Boolean = false
+    private var lastCommentStateChangeTime: Long = 0L
 
     private fun updateCommentSheetState(isOpen: Boolean) {
+        val now = System.currentTimeMillis()
         if (lastReportedCommentSheetState != isOpen) {
-            lastReportedCommentSheetState = isOpen
-            WatchSessionRepository.setCommentSheetOpen(isOpen)
+            // Debounce state transitions to prevent any blinking/flickering of the bottom lock bar
+            if (now - lastCommentStateChangeTime > 400L || !isOpen) {
+                lastReportedCommentSheetState = isOpen
+                lastCommentStateChangeTime = now
+                WatchSessionRepository.setCommentSheetOpen(isOpen)
+            }
         }
     }
 
     private fun isCommentOrChatSheetCurrentlyOpen(root: AccessibilityNodeInfo?): Boolean {
         if (isSoftKeyboardVisible()) return true
-        val node = root ?: getYouTubeRootNode() ?: return false
         val now = System.currentTimeMillis()
-        if (wasCommentComposerOpen && (now - lastCommentComposerOpenTime) < 5000L) {
+        if (wasCommentComposerOpen && (now - lastCommentComposerOpenTime) < 3500L) {
             return true
         }
+        val node = root ?: getYouTubeRootNode() ?: return false
         return checkCommentOrChatNodes(node)
     }
 
@@ -2794,38 +2809,23 @@ class YouTubeLiveSearchService : AccessibilityService() {
             val vId = node.viewIdResourceName?.lowercase() ?: ""
             val desc = node.contentDescription?.toString()?.lowercase() ?: ""
             val text = node.text?.toString()?.lowercase() ?: ""
-            val comb = "$desc $text $vId"
 
-            val isPanelOrSheet = vId.contains("engagement_panel") ||
-                    vId.contains("bottom_sheet") ||
-                    vId.contains("comment_composer") ||
-                    vId.contains("live_chat") ||
-                    vId.contains("chat_input") ||
-                    vId.contains("comment_box") ||
-                    vId.contains("reply_composer")
-
-            val isCommentOrChatHeader = desc.equals("close live chat", ignoreCase = true) ||
+            // Explicit close button of comments panel or live chat
+            val isExplicitCloseBtn = desc.equals("close comments", ignoreCase = true) ||
                     desc.equals("close chat", ignoreCase = true) ||
-                    desc.equals("close comments", ignoreCase = true) ||
+                    desc.equals("close live chat", ignoreCase = true) ||
                     desc.equals("close engagement panel", ignoreCase = true) ||
-                    text.equals("comments", ignoreCase = true) ||
-                    desc.equals("comments", ignoreCase = true) ||
-                    text.equals("live chat", ignoreCase = true) ||
-                    text.equals("top messages", ignoreCase = true) ||
-                    text.equals("chat...", ignoreCase = true) ||
-                    text.equals("add a comment...", ignoreCase = true) ||
-                    text.equals("add a reply...", ignoreCase = true) ||
-                    comb.contains("community guidelines") ||
-                    comb.contains("remember to keep comments") ||
-                    comb.contains("top") && comb.contains("newest") ||
                     desc.contains("टिप्पणी बंद करें") ||
                     desc.contains("लाइव चैट बंद करें") ||
-                    text.contains("टिप्पणियां")
+                    (vId.contains("close_button") && (desc.contains("close") || desc.contains("बंद") || text.contains("close")))
 
-            if (isPanelOrSheet && isCommentOrChatHeader) {
-                return true
-            }
-            if (isCommentOrChatHeader && (desc.contains("close") || desc.contains("बंद") || text.contains("comments") || desc.contains("comments"))) {
+            // Active comment composer box or keyboard input area
+            val isComposerActive = vId.contains("comment_composer") ||
+                    vId.contains("reply_composer") ||
+                    vId.contains("chat_input") ||
+                    vId.contains("comment_box")
+
+            if (isExplicitCloseBtn || isComposerActive) {
                 return true
             }
         }

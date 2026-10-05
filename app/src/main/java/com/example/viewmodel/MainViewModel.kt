@@ -426,7 +426,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     } catch (_: Exception) {}
                 }
-                delay(1_000L)
+                delay(3_000L)
             }
         }
 

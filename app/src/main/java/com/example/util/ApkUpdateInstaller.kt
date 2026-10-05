@@ -211,31 +211,32 @@ object ApkUpdateInstaller {
             }
 
             val candidateUrls = mutableListOf<String>()
-            if (updateInfo.fileId.isNotBlank() && !updateInfo.fileId.startsWith("apk_")) {
+            // Always prioritize direct download URL (e.g. GitHub Releases asset or direct APK host)
+            if (updateInfo.downloadUrl.isNotBlank()) {
+                candidateUrls.add(updateInfo.downloadUrl)
+            }
+            if (updateInfo.fileId.isNotBlank() && !updateInfo.fileId.startsWith("apk_") && !updateInfo.fileId.startsWith("gh_")) {
                 candidateUrls.add("https://drive.usercontent.google.com/download?id=${updateInfo.fileId}&export=download&confirm=t")
                 candidateUrls.add("https://drive.google.com/uc?export=download&id=${updateInfo.fileId}&confirm=t")
             }
-            if (updateInfo.downloadUrl.isNotBlank() && !candidateUrls.contains(updateInfo.downloadUrl)) {
-                candidateUrls.add(updateInfo.downloadUrl)
-            }
 
-            var lastError = "Unable to download update APK from Google Drive."
+            var lastError = "Update failed. Please try again."
 
             for (url in candidateUrls) {
                 val success = tryDownloadUrlToFile(context, url, targetFile, updateInfo.fileSize, onProgress)
                 if (success.isSuccess) {
-                    // Also mirror the verified APK to public Downloads/KingoKing_Update.apk
+                    // Mirror the verified APK to public Downloads/KingoKing_Update.apk
                     // so it remains accessible even if the old conflicting app is uninstalled!
                     mirrorApkToPublicDownloads(context, targetFile)
                     return@withContext Result.success(targetFile)
                 } else {
-                    lastError = success.exceptionOrNull()?.message ?: lastError
+                    lastError = "Update failed. Please try again."
                 }
             }
 
-            Result.failure(Exception(lastError))
+            Result.failure(Exception("Update failed. Please try again."))
         } catch (e: Exception) {
-            Result.failure(e)
+            Result.failure(Exception("Update failed. Please try again."))
         }
     }
 
@@ -255,18 +256,19 @@ object ApkUpdateInstaller {
                 .get()
                 .build()
 
-            val response = downloadClient.newCall(req).execute()
+            val response = try {
+                downloadClient.newCall(req).execute()
+            } catch (_: Exception) {
+                continue
+            }
             if (!response.isSuccessful) {
-                val code = response.code
                 response.close()
-                return Result.failure(
-                    Exception("Download failed (HTTP $code). Make sure the 'update' folder or APK in Google Drive is shared with 'Anyone with the link'.")
-                )
+                continue
             }
 
             val body = response.body ?: run {
                 response.close()
-                return Result.failure(Exception("Empty response from Google Drive."))
+                continue
             }
 
             val contentType = response.header("Content-Type")?.lowercase() ?: ""
@@ -280,46 +282,50 @@ object ApkUpdateInstaller {
                         continue
                     }
                 }
-                return Result.failure(
-                    Exception("Google Drive returned a web page instead of the APK. Please make sure the APK file in the 'update' folder has 'Anyone with the link' access enabled.")
-                )
+                continue
             }
 
             val totalBytes = if (body.contentLength() > 0) body.contentLength() else knownFileSize
             val totalMb = if (totalBytes > 0) totalBytes.toFloat() / (1024f * 1024f) else 0f
 
-            body.byteStream().use { input ->
-                FileOutputStream(targetFile).use { output ->
-                    val buffer = ByteArray(32 * 1024)
-                    var bytesRead: Int
-                    var downloadedBytes = 0L
-                    var firstChunkChecked = false
+            try {
+                body.byteStream().use { input ->
+                    FileOutputStream(targetFile).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        var bytesRead: Int
+                        var downloadedBytes = 0L
+                        var firstChunkChecked = false
 
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        if (!firstChunkChecked && bytesRead >= 2) {
-                            firstChunkChecked = true
-                            // APK files are ZIP archives and always start with 'P' (0x50) 'K' (0x4B)
-                            if (buffer[0] != 0x50.toByte() || buffer[1] != 0x4B.toByte()) {
-                                output.close()
-                                response.close()
-                                targetFile.delete()
-                                return Result.failure(
-                                    Exception("Downloaded file is not a valid APK package. Please check the file in the Google Drive 'update' folder.")
-                                )
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            if (!firstChunkChecked && bytesRead >= 2) {
+                                firstChunkChecked = true
+                                // APK files are ZIP archives and always start with 'P' (0x50) 'K' (0x4B)
+                                if (buffer[0] != 0x50.toByte() || buffer[1] != 0x4B.toByte()) {
+                                    output.close()
+                                    response.close()
+                                    targetFile.delete()
+                                    return Result.failure(
+                                        Exception("Update failed. Please try again.")
+                                    )
+                                }
                             }
+                            output.write(buffer, 0, bytesRead)
+                            downloadedBytes += bytesRead
+                            val dlMb = downloadedBytes.toFloat() / (1024f * 1024f)
+                            val pct = if (totalBytes > 0) {
+                                ((downloadedBytes * 100L) / totalBytes).toInt().coerceIn(1, 99)
+                            } else {
+                                50
+                            }
+                            onProgress(pct, dlMb, totalMb)
                         }
-                        output.write(buffer, 0, bytesRead)
-                        downloadedBytes += bytesRead
-                        val dlMb = downloadedBytes.toFloat() / (1024f * 1024f)
-                        val pct = if (totalBytes > 0) {
-                            ((downloadedBytes * 100L) / totalBytes).toInt().coerceIn(1, 99)
-                        } else {
-                            50
-                        }
-                        onProgress(pct, dlMb, totalMb)
+                        output.flush()
                     }
-                    output.flush()
                 }
+            } catch (_: Exception) {
+                response.close()
+                targetFile.delete()
+                continue
             }
             response.close()
 
@@ -333,7 +339,7 @@ object ApkUpdateInstaller {
                 if (archiveInfo == null) {
                     targetFile.delete()
                     return Result.failure(
-                        Exception("Downloaded file could not be parsed as a valid Android APK. Please upload a valid .apk file to the 'update' folder.")
+                        Exception("Update failed. Please try again.")
                     )
                 }
 
@@ -342,10 +348,9 @@ object ApkUpdateInstaller {
                 return Result.success(targetFile)
             } else {
                 targetFile.delete()
-                return Result.failure(Exception("Downloaded APK file is incomplete or corrupted."))
             }
         }
-        return Result.failure(Exception("Could not download APK from Google Drive."))
+        return Result.failure(Exception("Update failed. Please try again."))
     }
 
     private fun extractGoogleDriveConfirmUrl(html: String, fallbackCurrentUrl: String): String? {

@@ -157,6 +157,8 @@ object CloudDriveServerManager {
 
                 val deletedTaskIds = dataStoreManager.deletedTaskIdsFlow.first()
                 val deletedPostIds = dataStoreManager.deletedPostIdsFlow.first()
+                var remoteTasksArr: JSONArray? = null
+                var remotePostsArr: JSONArray? = null
 
                 if (remoteJson != null) {
                     // 1A. Parse Remote Users FIRST so we can accurately count per-task completions across all users
@@ -240,7 +242,7 @@ object CloudDriveServerManager {
                     }
 
                     // 1B. Parse Remote Tasks (with maxCompletions & live completedCount)
-                    val remoteTasksArr = adminStateObj?.optJSONArray("tasks") ?: remoteJson.optJSONArray("tasks")
+                    remoteTasksArr = adminStateObj?.optJSONArray("tasks") ?: remoteJson.optJSONArray("tasks")
                     if (remoteTasksArr != null) {
                         val parsedTasks = mutableListOf<VideoTaskItem>()
                         for (i in 0 until remoteTasksArr.length()) {
@@ -272,11 +274,9 @@ object CloudDriveServerManager {
                                 )
                             }
                         }
-                        if (!isAdminRole) {
-                            dataStoreManager.syncRemoteTasksFromServer(parsedTasks)
-                        } else if (isAdminRole && !pushAdminContent &&
-                            (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L
-                        ) {
+                        val currentTasks = dataStoreManager.videoTasksFlow.first()
+                        val hasOnlyDefaultOrNoTasks = currentTasks.isEmpty() || currentTasks.all { it.id.startsWith("task_") }
+                        if (!isAdminRole || hasOnlyDefaultOrNoTasks || (!pushAdminContent && (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L)) {
                             dataStoreManager.syncRemoteTasksFromServer(parsedTasks)
                         }
                     } else if (taskCompletionMap.isNotEmpty()) {
@@ -290,7 +290,7 @@ object CloudDriveServerManager {
                     }
 
                     // 1C. Parse Remote Admin Posts / Banners
-                    val remotePostsArr = adminStateObj?.optJSONArray("posts") ?: remoteJson.optJSONArray("posts")
+                    remotePostsArr = adminStateObj?.optJSONArray("posts") ?: remoteJson.optJSONArray("posts")
                     if (remotePostsArr != null) {
                         val parsedPosts = mutableListOf<AdminPostItem>()
                         for (i in 0 until remotePostsArr.length()) {
@@ -315,12 +315,10 @@ object CloudDriveServerManager {
                                 )
                             }
                         }
-                        // Sync remote posts (when in Admin role, skip if a local mutation happened recently)
-                        if (!isAdminRole) {
-                            dataStoreManager.syncAdminPosts(parsedPosts)
-                        } else if (isAdminRole && !pushAdminContent &&
-                            (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L
-                        ) {
+                        // Sync remote posts (when in Admin role, adopt server posts if local is default or after mutation window)
+                        val currentPosts = dataStoreManager.rawAdminPostsWithConfigFlow.first()
+                        val hasOnlyDefaultOrNoPosts = currentPosts.isEmpty() || currentPosts.all { it.id.startsWith("default_") || it.postType.startsWith("CONFIG_") }
+                        if (!isAdminRole || hasOnlyDefaultOrNoPosts || (!pushAdminContent && (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L)) {
                             dataStoreManager.syncAdminPosts(parsedPosts)
                         }
                     }
@@ -455,8 +453,6 @@ object CloudDriveServerManager {
                                     "https://drive.usercontent.google.com/download?id=$fId&export=download&confirm=t"
                                 }
                             )
-                        } else if (!hasUpd) {
-                            resolvedUpdate = AppUpdateInfo(hasUpdate = false)
                         }
                     }
 
@@ -478,7 +474,7 @@ object CloudDriveServerManager {
                         }
                     }
 
-                    if (resolvedUpdate != null) {
+                    if (resolvedUpdate != null && resolvedUpdate.hasUpdate) {
                         dataStoreManager.saveRemoteAppUpdate(resolvedUpdate)
                     }
                 } else {
@@ -532,47 +528,61 @@ object CloudDriveServerManager {
                     var pushedTasksArr: JSONArray? = null
                     var pushedPostsArr: JSONArray? = null
                     if (effectiveAdminPush && pushAdminContent) {
-                        val tasksArr = JSONArray()
-                        for (t in updatedTasks) {
-                            tasksArr.put(JSONObject().apply {
-                                put("id", t.id)
-                                put("title", t.title)
-                                put("channelName", t.channelName)
-                                put("videoUrl", t.videoUrl)
-                                put("thumbnailUrl", t.thumbnailUrl)
-                                put("rewardCoins", t.rewardCoins)
-                                put("durationSeconds", t.durationSeconds)
-                                put("isLive", t.isLive)
-                                put("selectedDurationSeconds", t.selectedDurationSeconds)
-                                put("isCompleted", false)
-                                put("lockedUntilMillis", 0L)
-                                put("createdAt", t.createdAt)
-                                put("isPinned", t.isPinned)
-                                put("pinnedAt", t.pinnedAt)
-                                put("maxCompletions", t.maxCompletions)
-                                put("completedCount", t.completedCount)
-                            })
+                        val localHasRealTasks = updatedTasks.any { !it.id.startsWith("task_") }
+                        val remoteHasRealTasks = (remoteTasksArr != null && remoteTasksArr.length() > 0)
+                        if (localHasRealTasks || !remoteHasRealTasks) {
+                            val tasksArr = JSONArray()
+                            for (t in updatedTasks) {
+                                tasksArr.put(JSONObject().apply {
+                                    put("id", t.id)
+                                    put("title", t.title)
+                                    put("channelName", t.channelName)
+                                    put("videoUrl", t.videoUrl)
+                                    put("thumbnailUrl", t.thumbnailUrl)
+                                    put("rewardCoins", t.rewardCoins)
+                                    put("durationSeconds", t.durationSeconds)
+                                    put("isLive", t.isLive)
+                                    put("selectedDurationSeconds", t.selectedDurationSeconds)
+                                    put("isCompleted", false)
+                                    put("lockedUntilMillis", 0L)
+                                    put("createdAt", t.createdAt)
+                                    put("isPinned", t.isPinned)
+                                    put("pinnedAt", t.pinnedAt)
+                                    put("maxCompletions", t.maxCompletions)
+                                    put("completedCount", t.completedCount)
+                                })
+                            }
+                            put("tasks", tasksArr)
+                            pushedTasksArr = tasksArr
+                        } else if (remoteTasksArr != null) {
+                            put("tasks", remoteTasksArr)
+                            pushedTasksArr = remoteTasksArr
                         }
-                        put("tasks", tasksArr)
-                        pushedTasksArr = tasksArr
 
-                        val postsArr = JSONArray()
-                        for (post in updatedPosts) {
-                            postsArr.put(JSONObject().apply {
-                                put("id", post.id)
-                                put("title", post.title)
-                                put("message", post.message)
-                                put("targetTab", post.targetTab)
-                                put("postType", post.postType)
-                                put("actionUrl", post.actionUrl)
-                                put("imageUrl", post.imageUrl)
-                                put("createdAt", post.createdAt)
-                                put("isPinned", post.isPinned)
-                                put("pinnedAt", post.pinnedAt)
-                            })
+                        val localHasRealPosts = updatedPosts.any { !it.id.startsWith("default_") && !it.postType.startsWith("CONFIG_") }
+                        val remoteHasRealPosts = (remotePostsArr != null && remotePostsArr.length() > 0)
+                        if (localHasRealPosts || !remoteHasRealPosts) {
+                            val postsArr = JSONArray()
+                            for (post in updatedPosts) {
+                                postsArr.put(JSONObject().apply {
+                                    put("id", post.id)
+                                    put("title", post.title)
+                                    put("message", post.message)
+                                    put("targetTab", post.targetTab)
+                                    put("postType", post.postType)
+                                    put("actionUrl", post.actionUrl)
+                                    put("imageUrl", post.imageUrl)
+                                    put("createdAt", post.createdAt)
+                                    put("isPinned", post.isPinned)
+                                    put("pinnedAt", post.pinnedAt)
+                                })
+                            }
+                            put("posts", postsArr)
+                            pushedPostsArr = postsArr
+                        } else if (remotePostsArr != null) {
+                            put("posts", remotePostsArr)
+                            pushedPostsArr = remotePostsArr
                         }
-                        put("posts", postsArr)
-                        pushedPostsArr = postsArr
                     }
 
                     val usersArr = JSONArray()

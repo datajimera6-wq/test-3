@@ -84,6 +84,9 @@ class FloatingTimerOverlayManager(private val context: Context) {
     private var suggestedLockTimerTextView: TextView? = null
     private var suggestedLockProgressFillView: View? = null
     private var suggestedLockStatusTagView: TextView? = null
+    private var suggestedLockLikePillView: TextView? = null
+    private var suggestedLockCommentPillView: TextView? = null
+    private var closeCommentsFloatButton: View? = null
 
     private var isOpeningOverlayEnabled: Boolean = true
 
@@ -138,16 +141,95 @@ class FloatingTimerOverlayManager(private val context: Context) {
 
     fun setSuggestedLockVisible(visible: Boolean) {
         runOnMain {
+            val root = suggestedLockRootView
             if (visible) {
-                if (suggestedLockRootView != null) {
-                    suggestedLockRootView?.visibility = View.VISIBLE
+                removeCloseCommentsFloatButton()
+                if (root != null) {
+                    try {
+                        val p = root.layoutParams as? WindowManager.LayoutParams
+                        if (p != null) {
+                            p.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            windowManager.updateViewLayout(root, p)
+                        }
+                        root.visibility = View.VISIBLE
+                    } catch (_: Exception) {}
                 } else if (isAttached && WatchSessionRepository.sessionState.value == com.example.data.SessionState.ACTIVE) {
                     showSuggestedVideosLockOverlay()
                 }
             } else {
-                suggestedLockRootView?.visibility = View.GONE
+                if (root != null) {
+                    try {
+                        root.visibility = View.GONE
+                        val p = root.layoutParams as? WindowManager.LayoutParams
+                        if (p != null) {
+                            p.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                            windowManager.updateViewLayout(root, p)
+                        }
+                    } catch (_: Exception) {}
+                }
+                showCloseCommentsFloatButton()
             }
         }
+    }
+
+    private fun showCloseCommentsFloatButton() {
+        if (!Settings.canDrawOverlays(context) || closeCommentsFloatButton != null) return
+        try {
+            val d = context.resources.displayMetrics.density
+            val screenWidth = context.resources.displayMetrics.widthPixels
+            val statusBarHeight = (30 * d).toInt()
+            val playerHeight = statusBarHeight + ((screenWidth * 9) / 16).coerceAtLeast((200 * d).toInt())
+            val btnParams = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WindowManager.LayoutParams.TYPE_PHONE
+                },
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.END
+                x = (14 * d).toInt()
+                y = playerHeight + (10 * d).toInt()
+            }
+
+            val btn = TextView(context).apply {
+                text = "✕ Close Comments"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                setPadding((14 * d).toInt(), (8 * d).toInt(), (14 * d).toInt(), (8 * d).toInt())
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 20 * d
+                    setColor(Color.parseColor("#E11D48")) // Crimson red
+                    setStroke((1.2f * d).toInt(), Color.parseColor("#FBBF24")) // Gold border
+                }
+                elevation = 25 * d
+                setOnClickListener {
+                    YouTubeLiveSearchService.closeCurrentCommentOrChatSheet()
+                    removeCloseCommentsFloatButton()
+                }
+            }
+            windowManager.addView(btn, btnParams)
+            globalAttachedViews.add(btn)
+            closeCommentsFloatButton = btn
+        } catch (_: Exception) {}
+    }
+
+    private fun removeCloseCommentsFloatButton() {
+        closeCommentsFloatButton?.let { btn ->
+            try { windowManager.removeView(btn) } catch (_: Exception) {}
+            globalAttachedViews.remove(btn)
+        }
+        closeCommentsFloatButton = null
     }
 
     private fun runOnMain(action: () -> Unit) {
@@ -999,8 +1081,6 @@ class FloatingTimerOverlayManager(private val context: Context) {
         rewardRow.addView(r1)
 
         val r2 = TextView(context).apply {
-            text = "👍 Like: +5c"
-            setTextColor(Color.parseColor("#FBBF24"))
             textSize = 9.5f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(
@@ -1009,16 +1089,48 @@ class FloatingTimerOverlayManager(private val context: Context) {
             ).apply {
                 rightMargin = (10 * density).toInt()
             }
+            if (isTaskLiked) {
+                text = "✓ Liked (+5c)"
+                setTextColor(Color.parseColor("#10B981"))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 8 * density
+                    setColor(Color.parseColor("#064E3B"))
+                    setStroke((0.9f * density).toInt(), Color.parseColor("#10B981"))
+                }
+                setPadding((6 * density).toInt(), (2 * density).toInt(), (6 * density).toInt(), (2 * density).toInt())
+            } else {
+                text = "👍 Like: +5c"
+                setTextColor(Color.parseColor("#FBBF24"))
+            }
         }
         rewardRow.addView(r2)
+        suggestedLockLikePillView = r2
 
         val r3 = TextView(context).apply {
-            text = "💬 Comment: +5c"
-            setTextColor(Color.parseColor("#38BDF8"))
             textSize = 9.5f
             typeface = android.graphics.Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+            if (currentCommentCount > 0) {
+                text = "✓ Comment: $currentCommentCount/2 (+5c)"
+                setTextColor(Color.parseColor("#10B981"))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 8 * density
+                    setColor(Color.parseColor("#064E3B"))
+                    setStroke((0.9f * density).toInt(), Color.parseColor("#10B981"))
+                }
+                setPadding((6 * density).toInt(), (2 * density).toInt(), (6 * density).toInt(), (2 * density).toInt())
+            } else {
+                text = "💬 Comment: +5c"
+                setTextColor(Color.parseColor("#38BDF8"))
+            }
         }
         rewardRow.addView(r3)
+        suggestedLockCommentPillView = r3
         infoCard.addView(rewardRow)
 
         cardLayout.addView(infoCard)
@@ -1099,9 +1211,22 @@ class FloatingTimerOverlayManager(private val context: Context) {
             setStroke((1 * density).toInt(), Color.parseColor("#10B981"))
         }
         likeBadgeView?.background = bg
+
+        suggestedLockLikePillView?.let { pill ->
+            pill.text = "✓ Liked (+5c)"
+            pill.setTextColor(Color.parseColor("#10B981"))
+            pill.background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 8 * density
+                setColor(Color.parseColor("#064E3B"))
+                setStroke((0.9f * density).toInt(), Color.parseColor("#10B981"))
+            }
+            pill.setPadding((6 * density).toInt(), (2 * density).toInt(), (6 * density).toInt(), (2 * density).toInt())
+        }
     }
 
     private fun updateCommentBadge() {
+        val commentPillText = if (currentCommentCount >= 2) "✓ Comments (+10c)" else if (currentCommentCount > 0) "✓ Comment: $currentCommentCount/2 (+5c)" else "💬 Comment: +5c"
         if (currentCommentCount >= 2) {
             commentBadgeView?.text = "✓ Comments (+10c)"
             commentBadgeView?.setTextColor(Color.parseColor("#10B981"))
@@ -1114,6 +1239,20 @@ class FloatingTimerOverlayManager(private val context: Context) {
             commentBadgeView?.background = bg
         } else if (currentCommentCount > 0) {
             commentBadgeView?.text = "💬 +5c ($currentCommentCount/2)"
+        }
+
+        suggestedLockCommentPillView?.let { pill ->
+            if (currentCommentCount > 0) {
+                pill.text = commentPillText
+                pill.setTextColor(Color.parseColor("#10B981"))
+                pill.background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = 8 * density
+                    setColor(Color.parseColor("#064E3B"))
+                    setStroke((0.9f * density).toInt(), Color.parseColor("#10B981"))
+                }
+                pill.setPadding((6 * density).toInt(), (2 * density).toInt(), (6 * density).toInt(), (2 * density).toInt())
+            }
         }
     }
 

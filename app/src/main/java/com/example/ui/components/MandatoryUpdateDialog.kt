@@ -220,8 +220,8 @@ fun MandatoryUpdateDialog(
             result.onSuccess { apkFile ->
                 downloadedApkFile = apkFile
                 executeInstallForDownloadedApk(apkFile)
-            }.onFailure { err ->
-                errorMessage = err.message ?: "Failed to download update from Google Drive."
+            }.onFailure { _ ->
+                errorMessage = "Update failed. Please try again."
             }
         }
     }
@@ -544,6 +544,7 @@ fun MandatoryUpdateDialog(
                             text = when {
                                 isDownloading -> "Updating..."
                                 downloadedApkFile != null -> "Install Now"
+                                errorMessage != null -> "Try Again"
                                 else -> "Update Now"
                             },
                             fontWeight = FontWeight.Black,

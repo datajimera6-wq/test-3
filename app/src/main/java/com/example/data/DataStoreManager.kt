@@ -635,11 +635,16 @@ class DataStoreManager(private val context: Context) {
     suspend fun saveRemoteAppUpdate(updateInfo: AppUpdateInfo?) {
         context.dataStore.edit { prefs ->
             if (updateInfo == null || !updateInfo.hasUpdate || (updateInfo.fileId.isBlank() && updateInfo.downloadUrl.isBlank())) {
-                prefs.remove(KEY_REMOTE_APP_UPDATE_JSON)
-                // If the update folder was emptied, clear installed signature so future uploads always trigger
-                prefs.remove(KEY_INSTALLED_UPDATE_SIGNATURE)
+                if (prefs.contains(KEY_REMOTE_APP_UPDATE_JSON)) {
+                    prefs.remove(KEY_REMOTE_APP_UPDATE_JSON)
+                    prefs.remove(KEY_INSTALLED_UPDATE_SIGNATURE)
+                }
             } else {
-                prefs[KEY_REMOTE_APP_UPDATE_JSON] = serializeAppUpdateInfoJson(updateInfo)
+                val newJson = serializeAppUpdateInfoJson(updateInfo)
+                val currentJson = prefs[KEY_REMOTE_APP_UPDATE_JSON]
+                if (currentJson != newJson) {
+                    prefs[KEY_REMOTE_APP_UPDATE_JSON] = newJson
+                }
             }
         }
     }
@@ -1644,12 +1649,15 @@ class DataStoreManager(private val context: Context) {
             } catch (_: Exception) {}
 
             val currentJson = prefs[KEY_ADMIN_POSTS]
-            val localList = if (currentJson == null) getDefaultAdminPosts() else parseAdminPostsJson(currentJson)
-
             val cleanRemote = posts.filter {
                 !it.postType.startsWith("CONFIG_") &&
                     !it.id.startsWith("__system_config_") &&
                     (com.example.BuildConfig.APP_ROLE != "ADMIN" || !deletedIds.contains(it.id))
+            }
+            val localList = if (currentJson == null) {
+                if (cleanRemote.isNotEmpty()) emptyList() else getDefaultAdminPosts()
+            } else {
+                parseAdminPostsJson(currentJson)
             }
 
             val remoteIds = cleanRemote.map { it.id }.toSet()
@@ -2079,7 +2087,11 @@ class DataStoreManager(private val context: Context) {
     suspend fun syncRemoteTasksFromServer(remoteTasks: List<VideoTaskItem>) {
         context.dataStore.edit { prefs ->
             val currentJson = prefs[KEY_VIDEO_TASKS]
-            val localList = if (currentJson.isNullOrBlank()) getDefaultTasks() else parseVideoTasksJson(currentJson)
+            val localList = if (currentJson.isNullOrBlank()) {
+                if (remoteTasks.isNotEmpty()) emptyList() else getDefaultTasks()
+            } else {
+                parseVideoTasksJson(currentJson)
+            }
             val localMap = localList.associateBy { it.id }
 
             val deletedJson = prefs[KEY_DELETED_TASK_IDS] ?: "[]"
@@ -2108,7 +2120,7 @@ class DataStoreManager(private val context: Context) {
                     }
                 }.toMutableList()
 
-            // In Admin app, never let a stale remote poll erase a task that Admin added locally (unless Admin deleted it)
+            // In Admin app, preserve local admin-added tasks if they haven't been pushed or deleted yet
             if (com.example.BuildConfig.APP_ROLE == "ADMIN") {
                 val remoteIds = merged.map { it.id }.toSet()
                 for (localTask in localList) {
