@@ -411,10 +411,7 @@ object CloudDriveServerManager {
                     if (remoteConfiguredUpdateUrl != null && !isAdminRole) {
                         dataStoreManager.setUpdateDriveFolderUrl(remoteConfiguredUpdateUrl)
                     }
-                    if (!remoteConfiguredAppDownloadUrl.isNullOrBlank() &&
-                        !isAdminRole &&
-                        (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis > 30_000L)
-                    ) {
+                    if (!remoteConfiguredAppDownloadUrl.isNullOrBlank() && !isAdminRole) {
                         dataStoreManager.saveAppDownloadUrl(
                             DataStoreManager.normalizeAppDownloadUrl(remoteConfiguredAppDownloadUrl!!)
                         )

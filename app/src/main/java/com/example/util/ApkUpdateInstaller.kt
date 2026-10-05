@@ -562,17 +562,24 @@ object ApkUpdateInstaller {
                 "${context.packageName}.fileprovider",
                 apkFile
             )
-            val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
-                data = apkUri
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
                 putExtra(Intent.EXTRA_RETURN_RESULT, true)
                 putExtra(Intent.EXTRA_INSTALLER_PACKAGE_NAME, context.packageName)
-                putExtra("android.intent.extra.REPLACE_UNKNOWN_SOURCES", true)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(installIntent)
+            try {
+                val resInfoList = context.packageManager.queryIntentActivities(viewIntent, PackageManager.MATCH_DEFAULT_ONLY)
+                for (resolveInfo in resInfoList) {
+                    val pkgName = resolveInfo.activityInfo.packageName
+                    context.grantUriPermission(pkgName, apkUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            } catch (_: Exception) {}
+            context.startActivity(viewIntent)
             true
         } catch (_: Exception) {
             try {
@@ -581,15 +588,17 @@ object ApkUpdateInstaller {
                     "${context.packageName}.fileprovider",
                     apkFile
                 )
-                val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                    data = apkUri
                     setDataAndType(apkUri, "application/vnd.android.package-archive")
                     putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
                     putExtra(Intent.EXTRA_RETURN_RESULT, true)
                     putExtra(Intent.EXTRA_INSTALLER_PACKAGE_NAME, context.packageName)
+                    putExtra("android.intent.extra.REPLACE_UNKNOWN_SOURCES", true)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                context.startActivity(viewIntent)
+                context.startActivity(installIntent)
                 true
             } catch (_: Exception) {
                 installViaPackageInstallerSession(context, apkFile)

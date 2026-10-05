@@ -215,15 +215,6 @@ fun MandatoryUpdateDialog(
         val report = ApkUpdateInstaller.inspectApkCompatibility(context, apkFile)
         compatibilityReport = report
 
-        // If the downloaded APK is the exact same version or older than already installed, mark installed immediately
-        if (!report.hasSignatureConflict &&
-            report.installedVersionCode > 0L &&
-            report.archiveVersionCode <= report.installedVersionCode
-        ) {
-            onMarkUpdateInstalled(updateInfo.signature)
-            return
-        }
-
         installAttemptedInSession = true
         if (report.requiresUninstallToReplace) {
             showReplaceExistingHelper = true
@@ -237,7 +228,12 @@ fun MandatoryUpdateDialog(
             val launched = ApkUpdateInstaller.launchApkInstaller(context, apkFile, updateInfo.signature)
             if (!launched) {
                 showReplaceExistingHelper = true
-                ApkDownloadSession.errorMessage = "Update failed. Please try again."
+                ApkDownloadSession.errorMessage = "Tap 'Replace & Install Update' below to install cleanly."
+                ApkUpdateInstaller.replaceConflictingAppAndInstall(
+                    context = context,
+                    apkFile = apkFile,
+                    targetPackageName = report.archivePackageName.ifBlank { context.packageName }
+                )
             }
         }
     }

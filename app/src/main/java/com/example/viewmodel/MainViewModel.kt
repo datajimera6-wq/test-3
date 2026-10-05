@@ -168,16 +168,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Returns the latest updated direct download APK URL (from Google Drive update or configured download link),
+     * Returns the latest updated direct download APK URL (prioritizing Admin configured app link),
      * with the 6-digit referral key embedded.
      */
     fun getEffectiveShareDownloadUrl(referralCode: String): String {
-        val latestUpdate = remoteAppUpdate.value
-        val base = if (latestUpdate != null && latestUpdate.hasUpdate && latestUpdate.downloadUrl.isNotBlank()) {
-            latestUpdate.downloadUrl
+        val configured = appDownloadUrl.value.trim()
+        val base = if (configured.isNotBlank() && !configured.contains("drive.google.com/drive/folders")) {
+            configured
         } else {
-            val configured = appDownloadUrl.value.ifBlank { updateDriveFolderUrl.value }
-            if (configured.isNotBlank()) configured else DataStoreManager.DEFAULT_APP_DOWNLOAD_URL
+            val latestUpdate = remoteAppUpdate.value
+            if (latestUpdate != null && latestUpdate.hasUpdate && latestUpdate.downloadUrl.isNotBlank()) {
+                latestUpdate.downloadUrl
+            } else if (configured.isNotBlank()) {
+                configured
+            } else {
+                val driveFolder = updateDriveFolderUrl.value.trim()
+                if (driveFolder.isNotBlank()) driveFolder else DataStoreManager.DEFAULT_APP_DOWNLOAD_URL
+            }
         }
         return DataStoreManager.toDirectDownloadUrl(base, referralCode)
     }
