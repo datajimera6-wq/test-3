@@ -186,7 +186,12 @@ object WatchSessionRepository {
         onTaskLikeDetected?.invoke()
     }
 
+    private var lastTriggerTaskCommentTime: Long = 0L
+
     fun triggerTaskComment() {
+        val now = System.currentTimeMillis()
+        if (now - lastTriggerTaskCommentTime < 15_000L) return
+        lastTriggerTaskCommentTime = now
         onTaskCommentDetected?.invoke()
     }
 

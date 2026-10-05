@@ -45,11 +45,26 @@ class YouTubeLiveSearchService : AccessibilityService() {
 
         fun closeCurrentCommentOrChatSheet(): Boolean {
             val srv = instance ?: return false
-            return try {
+            wasCommentComposerOpen = false
+            wasCommentEditTextActive = false
+            hasTypedCommentText = false
+            srv.updateCommentSheetState(false)
+            try {
+                val root = srv.getYouTubeRootNode() ?: srv.rootInActiveWindow
+                if (root != null) {
+                    val closeNode = srv.findCloseCommentNode(root)
+                    if (closeNode != null) {
+                        closeNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        closeNode.recycle()
+                    }
+                }
+            } catch (_: Exception) {}
+
+            try {
                 srv.performGlobalAction(GLOBAL_ACTION_BACK)
-            } catch (_: Exception) {
-                false
-            }
+            } catch (_: Exception) {}
+
+            return true
         }
 
         @Volatile
@@ -854,8 +869,6 @@ class YouTubeLiveSearchService : AccessibilityService() {
                     }
                 } else if (isGenuineCommentSubmitted) {
                     lastCommentClickTime = System.currentTimeMillis()
-                    lastCommentComposerOpenTime = System.currentTimeMillis()
-                    wasCommentComposerOpen = true
                     triggerGenuineCommentReward("Clicked YouTube Comment Send button")
                 } else if (isPlayPauseBtnClick) {
                     // Toggle immediately for instant UI responsiveness, then verify actual post-click button state
@@ -2740,7 +2753,7 @@ class YouTubeLiveSearchService : AccessibilityService() {
 
     private fun triggerGenuineCommentReward(reason: String) {
         val now = System.currentTimeMillis()
-        if (now - lastCommentRewardTriggerTime < 3500L) {
+        if (now - lastCommentRewardTriggerTime < 20_000L) {
             return
         }
         lastCommentRewardTriggerTime = now
@@ -2837,6 +2850,34 @@ class YouTubeLiveSearchService : AccessibilityService() {
             if (found) return true
         }
         return false
+    }
+
+    fun findCloseCommentNode(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (node == null) return null
+        if (node.isVisibleToUser) {
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            val vId = node.viewIdResourceName?.lowercase() ?: ""
+            val text = node.text?.toString()?.lowercase() ?: ""
+            val isClose = desc.equals("close comments", ignoreCase = true) ||
+                    desc.equals("close chat", ignoreCase = true) ||
+                    desc.equals("close live chat", ignoreCase = true) ||
+                    desc.equals("close", ignoreCase = true) ||
+                    desc.contains("टिप्पणी बंद") ||
+                    desc.contains("बंद करें") ||
+                    (vId.contains("close_button") && (desc.contains("close") || text.contains("close") || desc.contains("बंद")))
+            if (isClose && node.isClickable) {
+                return node
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findCloseCommentNode(child)
+            if (found != null) {
+                return found
+            }
+            child.recycle()
+        }
+        return null
     }
 
     private fun isSoftKeyboardVisible(): Boolean {
@@ -3398,10 +3439,6 @@ class YouTubeLiveSearchService : AccessibilityService() {
 
     private fun isCommentsSheetOrKeyboardOpen(entries: List<UiNodeEntry>): Boolean {
         if (isSoftKeyboardVisible()) return true
-        val now = System.currentTimeMillis()
-        if ((now - lastCommentClickTime) < 8000L || (now - lastTypedCommentTime) < 8000L || (now - lastCommentComposerOpenTime) < 15000L) {
-            return true
-        }
         val screenHeight = resources.displayMetrics.heightPixels.coerceAtLeast(800)
         
         // True comment sheet or composer is open ONLY when active composer, close button, or engagement panel is displayed
@@ -3409,23 +3446,17 @@ class YouTubeLiveSearchService : AccessibilityService() {
             val d = e.desc.trim().lowercase()
             val v = e.viewId.lowercase()
             (d == "close comments" || d == "टिप्पणियां बंद करें" || d.contains("close comment") || d == "close live chat" ||
-             (d == "close" && (v.contains("close_button") || v.contains("panel") || v.contains("sheet") || v.contains("header")))) &&
+             (d == "close" && (v.contains("close_button") || v.contains("panel") || v.contains("sheet")))) &&
             e.rect.top in (screenHeight * 0.10f).toInt()..(screenHeight * 0.95f).toInt()
         }
         if (hasCloseCommentBtn) return true
 
         return entries.any { e ->
             val v = e.viewId.lowercase()
-            val d = e.desc.trim().lowercase()
-            val t = e.text.trim().lowercase()
-            val comb = "$t $d $v"
-
-            (e.isEditable && (v.contains("comment") || v.contains("reply") || v.contains("composer") || v.contains("input"))) ||
-            v.contains("comment_sheet") ||
+            (e.isEditable && (v.contains("comment") || v.contains("reply") || v.contains("composer"))) ||
             v.contains("comment_composer") ||
             v.contains("comment_box") ||
-            (v.contains("engagement_panel") && (v.contains("comment") || comb.contains("comment_item") || comb.contains("टिप्पणी") || comb.contains("live chat"))) ||
-            (t.contains("community guidelines") || comb.contains("respectful by following") || comb.contains("top messages"))
+            v.contains("engagement_panel_comments")
         }
     }
 

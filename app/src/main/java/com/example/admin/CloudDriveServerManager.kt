@@ -274,11 +274,7 @@ object CloudDriveServerManager {
                                 )
                             }
                         }
-                        val currentTasks = dataStoreManager.videoTasksFlow.first()
-                        val hasOnlyDefaultOrNoTasks = currentTasks.isEmpty() || currentTasks.all { it.id.startsWith("task_") }
-                        if (!isAdminRole || hasOnlyDefaultOrNoTasks || (!pushAdminContent && (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L)) {
-                            dataStoreManager.syncRemoteTasksFromServer(parsedTasks)
-                        }
+                        dataStoreManager.syncRemoteTasksFromServer(parsedTasks)
                     } else if (taskCompletionMap.isNotEmpty()) {
                         // Even if tasks array wasn't in response, refresh local task completion counts from users
                         val currentLocalTasks = dataStoreManager.videoTasksFlow.first()
@@ -315,12 +311,7 @@ object CloudDriveServerManager {
                                 )
                             }
                         }
-                        // Sync remote posts (when in Admin role, adopt server posts if local is default or after mutation window)
-                        val currentPosts = dataStoreManager.rawAdminPostsWithConfigFlow.first()
-                        val hasOnlyDefaultOrNoPosts = currentPosts.isEmpty() || currentPosts.all { it.id.startsWith("default_") || it.postType.startsWith("CONFIG_") }
-                        if (!isAdminRole || hasOnlyDefaultOrNoPosts || (!pushAdminContent && (System.currentTimeMillis() - DataStoreManager.lastLocalMutationMillis) > 8_000L)) {
-                            dataStoreManager.syncAdminPosts(parsedPosts)
-                        }
+                        dataStoreManager.syncAdminPosts(parsedPosts)
                     }
 
                     // 1D. Parse Remote Payout Requests & Support Chat Messages
@@ -456,16 +447,9 @@ object CloudDriveServerManager {
                         }
                     }
 
-                    // Fallback: check configured update folder and appDownloadUrl (GitHub Releases URL)
+                    // Priority 1: Check Google Drive update folder
                     val effectiveFolderUrl = (remoteConfiguredUpdateUrl ?: dataStoreManager.updateDriveFolderUrlFlow.first()).trim()
                     val effectiveAppDlUrl = (remoteConfiguredAppDownloadUrl ?: dataStoreManager.appDownloadUrlFlow.first()).trim().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
-
-                    if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveAppDlUrl.isNotBlank()) {
-                        val dlUpdate = inspectPublicDriveUpdateLink(effectiveAppDlUrl)
-                        if (dlUpdate != null && dlUpdate.hasUpdate) {
-                            resolvedUpdate = dlUpdate
-                        }
-                    }
 
                     if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveFolderUrl.isNotBlank()) {
                         val folderUpdate = inspectPublicDriveUpdateLink(effectiveFolderUrl)
@@ -474,17 +458,38 @@ object CloudDriveServerManager {
                         }
                     }
 
+                    // Priority 2: Fallback to direct app download URL if Google Drive folder didn't yield an update
+                    if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveAppDlUrl.isNotBlank() && !effectiveAppDlUrl.contains("drive.google.com/drive/folders")) {
+                        val dlUpdate = inspectPublicDriveUpdateLink(effectiveAppDlUrl)
+                        if (dlUpdate != null && dlUpdate.hasUpdate) {
+                            resolvedUpdate = dlUpdate
+                        }
+                    }
+
                     if (resolvedUpdate != null && resolvedUpdate.hasUpdate) {
                         dataStoreManager.saveRemoteAppUpdate(resolvedUpdate)
                     }
                 } else {
-                    // When remoteJson is null, still inspect appDownloadUrl (GitHub Releases) so updates work independently
-                    val effectiveAppDlUrl = dataStoreManager.appDownloadUrlFlow.first().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
-                    if (effectiveAppDlUrl.isNotBlank()) {
-                        val dlUpdate = inspectPublicDriveUpdateLink(effectiveAppDlUrl)
-                        if (dlUpdate != null && dlUpdate.hasUpdate) {
-                            dataStoreManager.saveRemoteAppUpdate(dlUpdate)
+                    // When remoteJson is null, inspect Google Drive folder first, then fallback
+                    val effectiveFolderUrl = dataStoreManager.updateDriveFolderUrlFlow.first().trim()
+                    var resolvedUpdate: AppUpdateInfo? = null
+                    if (effectiveFolderUrl.isNotBlank()) {
+                        val folderUpdate = inspectPublicDriveUpdateLink(effectiveFolderUrl)
+                        if (folderUpdate != null && folderUpdate.hasUpdate) {
+                            resolvedUpdate = folderUpdate
                         }
+                    }
+                    if (resolvedUpdate == null || !resolvedUpdate.hasUpdate) {
+                        val effectiveAppDlUrl = dataStoreManager.appDownloadUrlFlow.first().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
+                        if (effectiveAppDlUrl.isNotBlank() && !effectiveAppDlUrl.contains("drive.google.com/drive/folders")) {
+                            val dlUpdate = inspectPublicDriveUpdateLink(effectiveAppDlUrl)
+                            if (dlUpdate != null && dlUpdate.hasUpdate) {
+                                resolvedUpdate = dlUpdate
+                            }
+                        }
+                    }
+                    if (resolvedUpdate != null && resolvedUpdate.hasUpdate) {
+                        dataStoreManager.saveRemoteAppUpdate(resolvedUpdate)
                     }
                 }
 
@@ -898,10 +903,11 @@ object CloudDriveServerManager {
         if (folderMatch != null) {
             val folderId = folderMatch.groupValues[1]
             return try {
-                val embedUrl = "https://drive.google.com/embeddedfolderview?id=$folderId#list"
+                val folderUrl = "https://drive.google.com/drive/folders/$folderId"
                 val req = Request.Builder()
-                    .url(embedUrl)
+                    .url(folderUrl)
                     .header("User-Agent", USER_AGENT)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .header("Cache-Control", "no-cache")
                     .get()
                     .build()
@@ -909,33 +915,110 @@ object CloudDriveServerManager {
                 val html = res.body?.string() ?: ""
                 res.close()
 
-                // Parse flip-entry items inside the Google Drive folder
-                val entryRegex = Regex(
-                    """id="entry-([a-zA-Z0-9_-]{15,})"[\s\S]*?<div class="flip-entry-title">([^<]+)</div>[\s\S]*?<div class="flip-entry-last-modified">\s*<div>([^<]*)</div>""",
-                    RegexOption.IGNORE_CASE
-                )
-                val matches = entryRegex.findAll(html).toList()
-                val apkEntry = matches.firstOrNull { m ->
-                    m.groupValues[2].trim().endsWith(".apk", ignoreCase = true)
-                } ?: matches.firstOrNull()
+                var parsedInfo: AppUpdateInfo? = null
 
-                if (apkEntry != null) {
-                    val fileId = apkEntry.groupValues[1].trim()
-                    val fileName = apkEntry.groupValues[2].trim().ifBlank { "KingoKing_Update.apk" }
-                    val modStr = apkEntry.groupValues[3].trim()
-                    val syntheticStamp = Math.abs("${fileId}_${fileName}_${modStr}".hashCode().toLong()).coerceAtLeast(1L)
-                    AppUpdateInfo(
-                        hasUpdate = true,
-                        fileId = fileId,
-                        fileName = fileName,
-                        updatedAtMillis = syntheticStamp,
-                        fileSize = 0L,
-                        downloadUrl = "https://drive.usercontent.google.com/download?id=$fileId&export=download&confirm=t"
-                    )
-                } else {
-                    // Folder exists and is reachable, but no APK is inside -> no active update
-                    AppUpdateInfo(hasUpdate = false)
+                // Method A: Parse window['_DRIVE_ivd'] initial data callback
+                val ivdMatch = Regex("""window\['_DRIVE_ivd'\]\s*=\s*'([^']+)'""").find(html)
+                if (ivdMatch != null) {
+                    try {
+                        val unescaped = unescapeDriveHex(ivdMatch.groupValues[1])
+                        val rootArr = JSONArray(unescaped)
+                        val filesArr = rootArr.optJSONArray(0)
+                        if (filesArr != null) {
+                            for (i in 0 until filesArr.length()) {
+                                val item = filesArr.optJSONArray(i) ?: continue
+                                val fId = item.optString(0, "")
+                                val fName = item.optString(2, "")
+                                if (fId.isNotBlank() && fName.endsWith(".apk", ignoreCase = true)) {
+                                    val t1 = item.optLong(9, 0L)
+                                    val t2 = item.optLong(10, 0L)
+                                    val modTime = maxOf(t1, t2)
+                                    val size = item.optLong(13, 0L)
+                                    val effectiveTime = if (modTime > 0L) modTime else 0L
+                                    parsedInfo = AppUpdateInfo(
+                                        hasUpdate = true,
+                                        fileId = fId,
+                                        fileName = fName,
+                                        updatedAtMillis = effectiveTime,
+                                        fileSize = size,
+                                        downloadUrl = "https://drive.usercontent.google.com/download?id=$fId&export=download&confirm=t"
+                                    )
+                                    break
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
+
+                // Method B: Regex extraction on folder HTML (unescaped or raw)
+                if (parsedInfo == null) {
+                    val unescapedHtml = unescapeDriveHex(html)
+                    val regexWithTimes = Regex(
+                        """\["([a-zA-Z0-9_-]{25,})",\s*\["([a-zA-Z0-9_-]+)"\],\s*"([^"]+\.apk)"[^\d]*(\d{12,13})[^\d]*(\d{12,13})?""",
+                        RegexOption.IGNORE_CASE
+                    )
+                    val mTimes = regexWithTimes.find(unescapedHtml) ?: regexWithTimes.find(html)
+                    if (mTimes != null) {
+                        val fId = mTimes.groupValues[1]
+                        val fName = mTimes.groupValues[3]
+                        val t1 = mTimes.groupValues[4].toLongOrNull() ?: 0L
+                        val t2 = mTimes.groupValues.getOrNull(5)?.toLongOrNull() ?: 0L
+                        val effectiveTime = maxOf(t1, t2)
+                        parsedInfo = AppUpdateInfo(
+                            hasUpdate = true,
+                            fileId = fId,
+                            fileName = fName,
+                            updatedAtMillis = effectiveTime,
+                            fileSize = 0L,
+                            downloadUrl = "https://drive.usercontent.google.com/download?id=$fId&export=download&confirm=t"
+                        )
+                    } else {
+                        val regexApk = Regex("""\["([a-zA-Z0-9_-]{25,})"[^\]]*?"([^"]+\.apk)"""", RegexOption.IGNORE_CASE)
+                        val m = regexApk.find(unescapedHtml) ?: regexApk.find(html)
+                        if (m != null) {
+                            val fId = m.groupValues[1]
+                            val fName = m.groupValues[2]
+                            parsedInfo = AppUpdateInfo(
+                                hasUpdate = true,
+                                fileId = fId,
+                                fileName = fName,
+                                updatedAtMillis = 0L,
+                                fileSize = 0L,
+                                downloadUrl = "https://drive.usercontent.google.com/download?id=$fId&export=download&confirm=t"
+                            )
+                        }
+                    }
+                }
+
+                // Method C: Legacy embeddedfolderview fallback
+                if (parsedInfo == null) {
+                    try {
+                        val embedUrl = "https://drive.google.com/embeddedfolderview?id=$folderId#list"
+                        val embedReq = Request.Builder().url(embedUrl).header("User-Agent", USER_AGENT).get().build()
+                        val embedRes = httpClient.newCall(embedReq).execute()
+                        val embedHtml = embedRes.body?.string() ?: ""
+                        embedRes.close()
+                        val entryRegex = Regex(
+                            """id="entry-([a-zA-Z0-9_-]{15,})"[\s\S]*?<div class="flip-entry-title">([^<]+)</div>[\s\S]*?<div class="flip-entry-last-modified">\s*<div>([^<]*)</div>""",
+                            RegexOption.IGNORE_CASE
+                        )
+                        val match = entryRegex.findAll(embedHtml).firstOrNull { it.groupValues[2].trim().endsWith(".apk", ignoreCase = true) }
+                        if (match != null) {
+                            val fId = match.groupValues[1].trim()
+                            val fName = match.groupValues[2].trim()
+                            parsedInfo = AppUpdateInfo(
+                                hasUpdate = true,
+                                fileId = fId,
+                                fileName = fName,
+                                updatedAtMillis = 0L,
+                                fileSize = 0L,
+                                downloadUrl = "https://drive.usercontent.google.com/download?id=$fId&export=download&confirm=t"
+                            )
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                parsedInfo ?: AppUpdateInfo(hasUpdate = false)
             } catch (_: Exception) {
                 null
             }
@@ -1165,6 +1248,29 @@ object CloudDriveServerManager {
             return info
         } catch (_: Exception) {
             return null
+        }
+    }
+
+    private fun unescapeDriveHex(str: String): String {
+        return try {
+            val sb = java.lang.StringBuilder(str.length)
+            var i = 0
+            while (i < str.length) {
+                if (i + 3 < str.length && str[i] == '\\' && str[i + 1] == 'x') {
+                    val hex = str.substring(i + 2, i + 4)
+                    sb.append(hex.toInt(16).toChar())
+                    i += 4
+                } else if (i + 1 < str.length && str[i] == '\\' && str[i + 1] == '/') {
+                    sb.append('/')
+                    i += 2
+                } else {
+                    sb.append(str[i])
+                    i++
+                }
+            }
+            sb.toString()
+        } catch (_: Exception) {
+            str
         }
     }
 

@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -74,6 +75,9 @@ class DataStoreManager(private val context: Context) {
         const val SYSTEM_CONFIG_APP_LINK_ID = "__system_config_app_download_url__"
         const val SYSTEM_CONFIG_REF_SHARE_ID = "__system_config_last_referral_share__"
         const val SYSTEM_CONFIG_FULL_SCREEN_OVERLAY_ID = "__system_config_full_screen_overlay__"
+
+        const val DEFAULT_UPDATE_DRIVE_FOLDER_URL =
+            "https://drive.google.com/drive/folders/1uXzPZApEdSGe7rsvRkdeUSxVKtVL_J3j?usp=sharing"
 
         const val DEFAULT_APP_DOWNLOAD_URL =
             "https://github.com/datajimera2-web/Kingo-King-App/releases/download/v1/kingoking.apk"
@@ -302,7 +306,7 @@ class DataStoreManager(private val context: Context) {
     }
 
     val updateDriveFolderUrlFlow: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[KEY_UPDATE_DRIVE_FOLDER_URL] ?: ""
+        prefs[KEY_UPDATE_DRIVE_FOLDER_URL]?.ifBlank { DEFAULT_UPDATE_DRIVE_FOLDER_URL } ?: DEFAULT_UPDATE_DRIVE_FOLDER_URL
     }
 
     val appDownloadUrlFlow: Flow<String> = context.dataStore.data.map { prefs ->
@@ -789,49 +793,60 @@ class DataStoreManager(private val context: Context) {
         }
     }
 
+    private val commentRecordMutex = kotlinx.coroutines.sync.Mutex()
+    private val lastCommentRecordTimes = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     suspend fun recordTaskComment(taskId: String, taskTitle: String = "YouTube Video"): Pair<Boolean, String> {
-        lastLocalMutationMillis = System.currentTimeMillis()
-        var added = false
-        var message = ""
-        context.dataStore.edit { prefs ->
-            val json = prefs[KEY_COMMENT_COUNTS] ?: "{}"
-            val obj = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
-            val currentCount = obj.optInt(taskId, 0)
-            if (currentCount >= 2) {
-                message = "Maximum 2 comments reached for this task (+10 coins limit)."
-                added = false
-            } else {
-                val newCount = currentCount + 1
-                obj.put(taskId, newCount)
-                prefs[KEY_COMMENT_COUNTS] = obj.toString()
-
-                val currentBalance = prefs[KEY_WALLET_BALANCE] ?: 0
-                prefs[KEY_WALLET_BALANCE] = currentBalance + 5
-
-                val currentTxJson = prefs[KEY_TRANSACTIONS] ?: "[]"
-                val list = parseTransactionsJson(currentTxJson).toMutableList()
-                list.add(
-                    0,
-                    WalletTransaction(
-                        id = UUID.randomUUID().toString(),
-                        title = "💬 Video Comment #$newCount Bonus: $taskTitle",
-                        coins = 5,
-                        timestampMillis = System.currentTimeMillis()
-                    )
-                )
-                val serializedTx = serializeTransactionsJson(list)
-                prefs[KEY_TRANSACTIONS] = serializedTx
-                syncActiveUserIntoUsersList(
-                    prefs,
-                    newBalanceOverride = currentBalance + 5,
-                    newTxJsonOverride = serializedTx,
-                    newCommentsJsonOverride = obj.toString()
-                )
-                added = true
-                message = "🎉 +5 Coins added for Comment #$newCount on video!"
+        commentRecordMutex.withLock {
+            val now = System.currentTimeMillis()
+            val lastTime = lastCommentRecordTimes[taskId] ?: 0L
+            if (now - lastTime < 10_000L) {
+                return Pair(false, "Comment already recorded recently.")
             }
+            lastCommentRecordTimes[taskId] = now
+            lastLocalMutationMillis = now
+            var added = false
+            var message = ""
+            context.dataStore.edit { prefs ->
+                val json = prefs[KEY_COMMENT_COUNTS] ?: "{}"
+                val obj = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
+                val currentCount = obj.optInt(taskId, 0)
+                if (currentCount >= 2) {
+                    message = "Maximum 2 comments reached for this task (+10 coins limit)."
+                    added = false
+                } else {
+                    val newCount = currentCount + 1
+                    obj.put(taskId, newCount)
+                    prefs[KEY_COMMENT_COUNTS] = obj.toString()
+
+                    val currentBalance = prefs[KEY_WALLET_BALANCE] ?: 0
+                    prefs[KEY_WALLET_BALANCE] = currentBalance + 5
+
+                    val currentTxJson = prefs[KEY_TRANSACTIONS] ?: "[]"
+                    val list = parseTransactionsJson(currentTxJson).toMutableList()
+                    list.add(
+                        0,
+                        WalletTransaction(
+                            id = UUID.randomUUID().toString(),
+                            title = "💬 Video Comment #$newCount Bonus: $taskTitle",
+                            coins = 5,
+                            timestampMillis = System.currentTimeMillis()
+                        )
+                    )
+                    val serializedTx = serializeTransactionsJson(list)
+                    prefs[KEY_TRANSACTIONS] = serializedTx
+                    syncActiveUserIntoUsersList(
+                        prefs,
+                        newBalanceOverride = currentBalance + 5,
+                        newTxJsonOverride = serializedTx,
+                        newCommentsJsonOverride = obj.toString()
+                    )
+                    added = true
+                    message = "🎉 +5 Coins added for Comment #$newCount on video!"
+                }
+            }
+            return Pair(added, message)
         }
-        return Pair(added, message)
     }
 
     suspend fun withdrawCoins(coins: Int, method: String, destination: String): Boolean {
@@ -1667,6 +1682,9 @@ class DataStoreManager(private val context: Context) {
             for (localPost in localList) {
                 if (localPost.postType.startsWith("CONFIG_") || localPost.id.startsWith("__system_config_")) continue
                 if (!remoteIds.contains(localPost.id) && !deletedIds.contains(localPost.id)) {
+                    if (cleanRemote.isNotEmpty() && localPost.id.startsWith("default_")) {
+                        continue
+                    }
                     val isRecent = (now - localPost.createdAt) < 120_000L
                     if (com.example.BuildConfig.APP_ROLE == "ADMIN" || isRecent) {
                         merged.add(0, localPost)
@@ -2125,6 +2143,9 @@ class DataStoreManager(private val context: Context) {
                 val remoteIds = merged.map { it.id }.toSet()
                 for (localTask in localList) {
                     if (!remoteIds.contains(localTask.id) && !deletedIds.contains(localTask.id)) {
+                        if (remoteTasks.isNotEmpty() && localTask.id.startsWith("task_")) {
+                            continue
+                        }
                         merged.add(0, localTask)
                     }
                 }

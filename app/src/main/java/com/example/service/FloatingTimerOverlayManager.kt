@@ -674,15 +674,18 @@ class FloatingTimerOverlayManager(private val context: Context) {
             showOverlay()
         }
 
-        // Check if active task is already liked or commented
-        val activeId = WatchSessionRepository.activeTaskId.value ?: "default_task"
+        // Continuously collect liked and commented state in real-time so bottom lock bar is always 100% updated!
         overlayScope.launch {
-            try {
-                val likedSet = dataStoreManager.likedTasksFlow.first()
-                val alreadyLiked = likedSet.contains(activeId)
-                val commentMap = dataStoreManager.commentCountsFlow.first()
-                val cCount = commentMap[activeId] ?: 0
-
+            kotlinx.coroutines.flow.combine(
+                dataStoreManager.likedTasksFlow,
+                dataStoreManager.commentCountsFlow,
+                WatchSessionRepository.activeTaskId
+            ) { likedSet, commentMap, activeId ->
+                val id = activeId ?: "default_task"
+                val alreadyLiked = likedSet.contains(id)
+                val cCount = commentMap[id] ?: 0
+                Pair(alreadyLiked, cCount)
+            }.collect { (alreadyLiked, cCount) ->
                 runOnMain {
                     isTaskLiked = alreadyLiked
                     if (alreadyLiked) {
@@ -691,7 +694,7 @@ class FloatingTimerOverlayManager(private val context: Context) {
                     currentCommentCount = cCount
                     updateCommentBadge()
                 }
-            } catch (_: Exception) {}
+            }
         }
     }
 
@@ -1177,7 +1180,15 @@ class FloatingTimerOverlayManager(private val context: Context) {
         }
     }
 
+    @Volatile
+    private var lastRecordedCommentTime: Long = 0L
+
     private fun handleCommentDetected() {
+        val now = System.currentTimeMillis()
+        if (now - lastRecordedCommentTime < 15_000L) {
+            return
+        }
+        lastRecordedCommentTime = now
         val taskId = WatchSessionRepository.activeTaskId.value ?: "default_task"
         val taskTitle = WatchSessionRepository.targetTaskTitle.value ?: "YouTube Video"
 
@@ -1252,6 +1263,11 @@ class FloatingTimerOverlayManager(private val context: Context) {
                     setStroke((0.9f * density).toInt(), Color.parseColor("#10B981"))
                 }
                 pill.setPadding((6 * density).toInt(), (2 * density).toInt(), (6 * density).toInt(), (2 * density).toInt())
+            } else {
+                pill.text = "💬 Comment: +5c"
+                pill.setTextColor(Color.parseColor("#38BDF8"))
+                pill.background = null
+                pill.setPadding((4 * density).toInt(), (2 * density).toInt(), (4 * density).toInt(), (2 * density).toInt())
             }
         }
     }

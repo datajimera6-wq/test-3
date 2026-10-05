@@ -211,26 +211,19 @@ object ApkUpdateInstaller {
             }
 
             val candidateUrls = mutableListOf<String>()
-            // Always prioritize direct download URL (e.g. GitHub Releases asset or direct APK host)
-            if (updateInfo.downloadUrl.isNotBlank()) {
-                candidateUrls.add(updateInfo.downloadUrl)
-            }
             if (updateInfo.fileId.isNotBlank() && !updateInfo.fileId.startsWith("apk_") && !updateInfo.fileId.startsWith("gh_")) {
                 candidateUrls.add("https://drive.usercontent.google.com/download?id=${updateInfo.fileId}&export=download&confirm=t")
                 candidateUrls.add("https://drive.google.com/uc?export=download&id=${updateInfo.fileId}&confirm=t")
             }
-
-            var lastError = "Update failed. Please try again."
+            if (updateInfo.downloadUrl.isNotBlank() && !candidateUrls.contains(updateInfo.downloadUrl)) {
+                candidateUrls.add(updateInfo.downloadUrl)
+            }
 
             for (url in candidateUrls) {
                 val success = tryDownloadUrlToFile(context, url, targetFile, updateInfo.fileSize, onProgress)
                 if (success.isSuccess) {
-                    // Mirror the verified APK to public Downloads/KingoKing_Update.apk
-                    // so it remains accessible even if the old conflicting app is uninstalled!
                     mirrorApkToPublicDownloads(context, targetFile)
                     return@withContext Result.success(targetFile)
-                } else {
-                    lastError = "Update failed. Please try again."
                 }
             }
 
@@ -248,14 +241,18 @@ object ApkUpdateInstaller {
         onProgress: (percent: Int, downloadedMb: Float, totalMb: Float) -> Unit
     ): Result<File> {
         var currentUrl = initialUrl
-        for (attempt in 1..3) {
-            val req = Request.Builder()
+        for (attempt in 1..4) {
+            val existingLen = if (targetFile.exists()) targetFile.length() else 0L
+            val reqBuilder = Request.Builder()
                 .url(currentUrl)
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "*/*")
-                .get()
-                .build()
 
+            if (existingLen > 0L) {
+                reqBuilder.header("Range", "bytes=$existingLen-")
+            }
+
+            val req = reqBuilder.build()
             val response = try {
                 downloadClient.newCall(req).execute()
             } catch (_: Exception) {
@@ -263,6 +260,10 @@ object ApkUpdateInstaller {
             }
             if (!response.isSuccessful) {
                 response.close()
+                if (existingLen > 0L && response.code == 416) {
+                    // Range not satisfiable, restart from scratch
+                    targetFile.delete()
+                }
                 continue
             }
 
@@ -275,7 +276,7 @@ object ApkUpdateInstaller {
             if (contentType.contains("text/html")) {
                 val html = body.string()
                 response.close()
-                if (attempt < 3) {
+                if (attempt < 4) {
                     val nextUrl = extractGoogleDriveConfirmUrl(html, currentUrl)
                     if (nextUrl != null) {
                         currentUrl = nextUrl
@@ -285,16 +286,23 @@ object ApkUpdateInstaller {
                 continue
             }
 
-            val totalBytes = if (body.contentLength() > 0) body.contentLength() else knownFileSize
+            val isPartial = response.code == 206
+            val appendMode = isPartial && existingLen > 0L
+            val contentLength = body.contentLength()
+            val totalBytes = if (appendMode) {
+                existingLen + (if (contentLength > 0L) contentLength else 0L)
+            } else {
+                if (contentLength > 0L) contentLength else knownFileSize
+            }
             val totalMb = if (totalBytes > 0) totalBytes.toFloat() / (1024f * 1024f) else 0f
 
             try {
                 body.byteStream().use { input ->
-                    FileOutputStream(targetFile).use { output ->
+                    FileOutputStream(targetFile, appendMode).use { output ->
                         val buffer = ByteArray(64 * 1024)
                         var bytesRead: Int
-                        var downloadedBytes = 0L
-                        var firstChunkChecked = false
+                        var downloadedBytes = if (appendMode) existingLen else 0L
+                        var firstChunkChecked = appendMode
 
                         while (input.read(buffer).also { bytesRead = it } != -1) {
                             if (!firstChunkChecked && bytesRead >= 2) {
@@ -304,9 +312,7 @@ object ApkUpdateInstaller {
                                     output.close()
                                     response.close()
                                     targetFile.delete()
-                                    return Result.failure(
-                                        Exception("Update failed. Please try again.")
-                                    )
+                                    return Result.failure(Exception("Update failed. Please try again."))
                                 }
                             }
                             output.write(buffer, 0, bytesRead)
@@ -324,12 +330,11 @@ object ApkUpdateInstaller {
                 }
             } catch (_: Exception) {
                 response.close()
-                targetFile.delete()
                 continue
             }
             response.close()
 
-            if (targetFile.exists() && targetFile.length() > 10_000L) {
+            if (targetFile.exists() && targetFile.length() > 50_000L) {
                 // Verify Android PackageManager can parse the downloaded APK archive
                 val archiveInfo = try {
                     context.packageManager.getPackageArchiveInfo(targetFile.absolutePath, 0)
@@ -338,16 +343,12 @@ object ApkUpdateInstaller {
                 }
                 if (archiveInfo == null) {
                     targetFile.delete()
-                    return Result.failure(
-                        Exception("Update failed. Please try again.")
-                    )
+                    return Result.failure(Exception("Update failed. Please try again."))
                 }
 
                 val finalMb = targetFile.length().toFloat() / (1024f * 1024f)
                 onProgress(100, finalMb, finalMb)
                 return Result.success(targetFile)
-            } else {
-                targetFile.delete()
             }
         }
         return Result.failure(Exception("Update failed. Please try again."))

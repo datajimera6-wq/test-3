@@ -430,19 +430,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Direct GitHub / Remote APK Update Checker (checks every 8s)
+        // Periodic Remote APK Update Checker (prioritizes Google Drive update folder)
         viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 try {
-                    val appDlUrl = dataStoreManager.appDownloadUrlFlow.first().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
-                    if (appDlUrl.isNotBlank()) {
-                        val upd = com.example.admin.CloudDriveServerManager.inspectPublicDriveUpdateLink(appDlUrl)
-                        if (upd != null && upd.hasUpdate) {
-                            dataStoreManager.saveRemoteAppUpdate(upd)
+                    val folderUrl = dataStoreManager.updateDriveFolderUrlFlow.first().trim()
+                    var upd = if (folderUrl.isNotBlank()) {
+                        com.example.admin.CloudDriveServerManager.inspectPublicDriveUpdateLink(folderUrl)
+                    } else null
+
+                    if (upd == null || !upd.hasUpdate) {
+                        val appDlUrl = dataStoreManager.appDownloadUrlFlow.first().trim()
+                        if (appDlUrl.isNotBlank() && !appDlUrl.contains("drive.google.com/drive/folders")) {
+                            upd = com.example.admin.CloudDriveServerManager.inspectPublicDriveUpdateLink(appDlUrl)
                         }
                     }
+
+                    if (upd != null && upd.hasUpdate) {
+                        dataStoreManager.saveRemoteAppUpdate(upd)
+                    }
                 } catch (_: Exception) {}
-                delay(8_000L)
+                delay(12_000L)
             }
         }
 

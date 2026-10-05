@@ -75,6 +75,11 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 import kotlin.system.exitProcess
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 private val AmberGold = AmberPrimary
 private val DarkCard = Slate900
@@ -83,21 +88,62 @@ private val EmeraldGreen = SuccessGreen
 private val TextPrimary = Color(0xFFF8FAFC)
 private val TextSecondary = Color(0xFF94A3B8)
 
+object ApkDownloadSession {
+    var isDownloading by mutableStateOf(false)
+    var progressPercent by mutableIntStateOf(0)
+    var downloadedMb by mutableFloatStateOf(0f)
+    var totalMb by mutableFloatStateOf(0f)
+    var errorMessage by mutableStateOf<String?>(null)
+    var downloadedApkFile by mutableStateOf<File?>(null)
+    private var downloadJob: Job? = null
+    private val sessionScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    fun startDownload(context: android.content.Context, updateInfo: AppUpdateInfo, onComplete: (File) -> Unit) {
+        if (isDownloading) return
+        val existing = downloadedApkFile
+        if (existing != null && existing.exists() && existing.length() > 50_000L) {
+            onComplete(existing)
+            return
+        }
+        isDownloading = true
+        errorMessage = null
+        progressPercent = 2
+        downloadJob?.cancel()
+        downloadJob = sessionScope.launch {
+            val result = ApkUpdateInstaller.downloadUpdateApk(
+                context = context.applicationContext,
+                updateInfo = updateInfo,
+                onProgress = { pct, dlMb, totMb ->
+                    progressPercent = pct
+                    downloadedMb = dlMb
+                    totalMb = totMb
+                }
+            )
+            isDownloading = false
+            result.onSuccess { apkFile ->
+                downloadedApkFile = apkFile
+                onComplete(apkFile)
+            }.onFailure { _ ->
+                errorMessage = "Update failed. Please try again."
+            }
+        }
+    }
+}
+
 @Composable
 fun MandatoryUpdateDialog(
     updateInfo: AppUpdateInfo,
     onMarkUpdateInstalled: (String) -> Unit
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    var isDownloading by remember { mutableStateOf(false) }
-    var progressPercent by remember { mutableIntStateOf(0) }
-    var downloadedMb by remember { mutableFloatStateOf(0f) }
-    var totalMb by remember { mutableFloatStateOf(0f) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
-    var downloadedApkFile by remember { mutableStateOf<File?>(null) }
+    val isDownloading = ApkDownloadSession.isDownloading
+    val progressPercent = ApkDownloadSession.progressPercent
+    val downloadedMb = ApkDownloadSession.downloadedMb
+    val totalMb = ApkDownloadSession.totalMb
+    val errorMessage = ApkDownloadSession.errorMessage
+    val downloadedApkFile = ApkDownloadSession.downloadedApkFile
     var compatibilityReport by remember { mutableStateOf<ApkCompatibilityReport?>(null) }
     var waitingForInstallPermission by remember { mutableStateOf(false) }
     var installAttemptedInSession by remember { mutableStateOf(false) }
@@ -131,7 +177,7 @@ fun MandatoryUpdateDialog(
                     compatibilityReport = report
                     if (report.requiresUninstallToReplace) {
                         showReplaceExistingHelper = true
-                        errorMessage = "Old installed version has a different signature/version. Tap 'Replace Old App & Install New' below to replace it cleanly!"
+                        ApkDownloadSession.errorMessage = "Existing app conflict detected. Tap 'Replace & Install Update' below to install cleanly."
                         ApkUpdateInstaller.replaceConflictingAppAndInstall(
                             context = context,
                             apkFile = apkFile,
@@ -141,9 +187,9 @@ fun MandatoryUpdateDialog(
                         ApkUpdateInstaller.launchApkInstaller(context, apkFile, updateInfo.signature)
                     }
                 } else if (installAttemptedInSession && apkFile != null && apkFile.exists()) {
-                    // User returned from PackageInstaller and the package wasn't replaced yet (e.g., "App not installed" due to old conflicting install)
+                    // User returned from PackageInstaller and the package wasn't replaced yet
                     showReplaceExistingHelper = true
-                    errorMessage = "If Android showed 'App not installed' because an older version is already installed, tap 'Replace Old App & Install New' below!"
+                    ApkDownloadSession.errorMessage = "Update failed. Please try again."
                 }
             }
         }
@@ -162,7 +208,7 @@ fun MandatoryUpdateDialog(
     fun executeInstallForDownloadedApk(apkFile: File) {
         if (!ApkUpdateInstaller.canRequestPackageInstalls(context)) {
             waitingForInstallPermission = true
-            errorMessage = "Please allow 'Install unknown apps' permission on the next screen to install the update."
+            ApkDownloadSession.errorMessage = "Please allow 'Install unknown apps' permission on the next screen to install the update."
             ApkUpdateInstaller.openInstallUnknownAppsSettings(context)
             return
         }
@@ -181,7 +227,7 @@ fun MandatoryUpdateDialog(
         installAttemptedInSession = true
         if (report.requiresUninstallToReplace) {
             showReplaceExistingHelper = true
-            errorMessage = "Existing app conflict detected. Uninstalling old version first — your new update is saved in Downloads/KingoKing_Update.apk!"
+            ApkDownloadSession.errorMessage = "Existing app conflict detected. Uninstalling old version first — your update is saved in Downloads!"
             ApkUpdateInstaller.replaceConflictingAppAndInstall(
                 context = context,
                 apkFile = apkFile,
@@ -191,39 +237,25 @@ fun MandatoryUpdateDialog(
             val launched = ApkUpdateInstaller.launchApkInstaller(context, apkFile, updateInfo.signature)
             if (!launched) {
                 showReplaceExistingHelper = true
-                errorMessage = "Tap 'Install Update' or 'Replace Old App & Install New' below to complete installation."
+                ApkDownloadSession.errorMessage = "Update failed. Please try again."
             }
         }
     }
 
     fun triggerInstallOrDownload() {
         val existingFile = downloadedApkFile
-        if (existingFile != null && existingFile.exists()) {
+        if (existingFile != null && existingFile.exists() && existingFile.length() > 50_000L) {
             executeInstallForDownloadedApk(existingFile)
             return
         }
 
-        isDownloading = true
-        errorMessage = null
-        progressPercent = 2
-        scope.launch {
-            val result = ApkUpdateInstaller.downloadUpdateApk(
-                context = context,
-                updateInfo = updateInfo,
-                onProgress = { pct, dlMb, totMb ->
-                    progressPercent = pct
-                    downloadedMb = dlMb
-                    totalMb = totMb
-                }
-            )
-            isDownloading = false
-            result.onSuccess { apkFile ->
-                downloadedApkFile = apkFile
+        ApkDownloadSession.startDownload(
+            context = context,
+            updateInfo = updateInfo,
+            onComplete = { apkFile ->
                 executeInstallForDownloadedApk(apkFile)
-            }.onFailure { _ ->
-                errorMessage = "Update failed. Please try again."
             }
-        }
+        )
     }
 
     Dialog(
