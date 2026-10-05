@@ -20,9 +20,21 @@ android {
     versionCode = autoVersionCode
     versionName = "2.0.$autoVersionCode"
 
-    buildConfigField("String", "APP_ROLE", "\"USER\"")
-
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+  }
+
+  flavorDimensions += "role"
+  productFlavors {
+    create("admin") {
+      dimension = "role"
+      applicationId = "com.example.kingo.rfumiv"
+      buildConfigField("String", "APP_ROLE", "\"ADMIN\"")
+    }
+    create("user") {
+      dimension = "role"
+      applicationId = "com.example.kingo.rfumiv"
+      buildConfigField("String", "APP_ROLE", "\"USER\"")
+    }
   }
 
   signingConfigs {
@@ -138,5 +150,16 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
+}
+
+val copyApkForPreview = tasks.register<Copy>("ensureDebugApkForPreview") {
+  from(layout.buildDirectory.dir("outputs/apk/user/debug"))
+  into(layout.buildDirectory.dir("outputs/apk/debug"))
+  include("*.apk")
+  rename { "app-debug.apk" }
+}
+
+tasks.matching { it.name == "assembleDebug" || it.name == "assembleUserDebug" }.configureEach {
+  finalizedBy(copyApkForPreview)
 }
 
