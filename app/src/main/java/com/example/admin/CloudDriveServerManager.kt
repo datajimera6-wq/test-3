@@ -30,6 +30,8 @@ object CloudDriveServerManager {
     private const val USER_AGENT =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     private val syncMutex = Mutex()
+    private var lastGithubCheckTime = 0L
+    private var cachedGithubUpdateInfo: AppUpdateInfo? = null
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -459,20 +461,20 @@ object CloudDriveServerManager {
                     }
 
                     // Fallback: check configured update folder and appDownloadUrl (GitHub Releases URL)
-                    val effectiveFolderUrl = remoteConfiguredUpdateUrl ?: dataStoreManager.updateDriveFolderUrlFlow.first()
-                    val effectiveAppDlUrl = remoteConfiguredAppDownloadUrl ?: dataStoreManager.appDownloadUrlFlow.first()
-
-                    if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveFolderUrl.isNotBlank()) {
-                        val folderUpdate = inspectPublicDriveUpdateLink(effectiveFolderUrl)
-                        if (folderUpdate != null && folderUpdate.hasUpdate) {
-                            resolvedUpdate = folderUpdate
-                        }
-                    }
+                    val effectiveFolderUrl = (remoteConfiguredUpdateUrl ?: dataStoreManager.updateDriveFolderUrlFlow.first()).trim()
+                    val effectiveAppDlUrl = (remoteConfiguredAppDownloadUrl ?: dataStoreManager.appDownloadUrlFlow.first()).trim().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
 
                     if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveAppDlUrl.isNotBlank()) {
                         val dlUpdate = inspectPublicDriveUpdateLink(effectiveAppDlUrl)
                         if (dlUpdate != null && dlUpdate.hasUpdate) {
                             resolvedUpdate = dlUpdate
+                        }
+                    }
+
+                    if ((resolvedUpdate == null || !resolvedUpdate.hasUpdate) && effectiveFolderUrl.isNotBlank()) {
+                        val folderUpdate = inspectPublicDriveUpdateLink(effectiveFolderUrl)
+                        if (folderUpdate != null && folderUpdate.hasUpdate) {
+                            resolvedUpdate = folderUpdate
                         }
                     }
 
@@ -855,9 +857,30 @@ object CloudDriveServerManager {
      * Inspects a public Google Drive "update" folder URL or direct APK file link to detect the newest APK file.
      * Works even if the Google Apps Script hasn't been redeployed yet!
      */
-    private fun inspectPublicDriveUpdateLink(rawUrl: String): AppUpdateInfo? {
-        val clean = rawUrl.trim()
+    fun inspectPublicDriveUpdateLink(rawUrl: String): AppUpdateInfo? {
+        var clean = rawUrl.trim()
         if (clean.isBlank()) return AppUpdateInfo(hasUpdate = false)
+
+        // Resolve shortened or redirect URLs (e.g. tinyurl.com, bit.ly, t.co, goo.gl)
+        if (clean.contains("tinyurl.com", ignoreCase = true) ||
+            clean.contains("bit.ly", ignoreCase = true) ||
+            clean.contains("t.co", ignoreCase = true) ||
+            clean.contains("goo.gl", ignoreCase = true)
+        ) {
+            try {
+                val headReq = Request.Builder()
+                    .url(clean)
+                    .header("User-Agent", USER_AGENT)
+                    .get()
+                    .build()
+                val headRes = httpClient.newCall(headReq).execute()
+                val finalUrl = headRes.request.url.toString()
+                headRes.close()
+                if (finalUrl.isNotBlank() && finalUrl != clean) {
+                    clean = finalUrl
+                }
+            } catch (_: Exception) {}
+        }
 
         // 1. Check if it's a Google Drive Folder URL: /folders/FOLDER_ID
         val folderRegex = Regex("folders/([a-zA-Z0-9_-]{15,})")
@@ -950,13 +973,40 @@ object CloudDriveServerManager {
 
         // 4. Direct APK HTTP link
         if (clean.startsWith("http://") || clean.startsWith("https://")) {
-            val syntheticId = "apk_${Math.abs(clean.hashCode())}"
+            val directHeaders = try {
+                val headReq = Request.Builder()
+                    .url(clean)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept", "*/*")
+                    .header("Cache-Control", "no-cache")
+                    .get()
+                    .build()
+                val headRes = httpClient.newCall(headReq).execute()
+                val lastMod = headRes.header("Last-Modified")
+                val etag = headRes.header("ETag") ?: ""
+                val len = headRes.header("Content-Length")?.toLongOrNull() ?: 0L
+                val creation = headRes.header("x-ms-creation-time")
+                headRes.close()
+                var parsedTime = 0L
+                val timeHeader = lastMod ?: creation
+                if (!timeHeader.isNullOrBlank()) {
+                    try {
+                        parsedTime = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", java.util.Locale.US).parse(timeHeader)?.time ?: 0L
+                    } catch (_: Exception) {}
+                }
+                Triple(parsedTime, etag, len)
+            } catch (_: Exception) {
+                Triple(0L, "", 0L)
+            }
+
+            val safeTime = if (directHeaders.first > 0L) directHeaders.first else Math.abs(clean.hashCode().toLong()).coerceAtLeast(1L)
+            val syntheticId = "apk_${Math.abs("${clean}_${directHeaders.second}_${directHeaders.third}_${safeTime}".hashCode())}"
             return AppUpdateInfo(
                 hasUpdate = true,
                 fileId = syntheticId,
-                fileName = "KingoKing_Update",
-                updatedAtMillis = Math.abs(clean.hashCode().toLong()).coerceAtLeast(1L),
-                fileSize = 0L,
+                fileName = "KingoKing_Update.apk",
+                updatedAtMillis = safeTime,
+                fileSize = directHeaders.third,
                 downloadUrl = clean
             )
         }
@@ -965,6 +1015,11 @@ object CloudDriveServerManager {
     }
 
     private fun inspectGitHubReleaseUpdate(rawGithubUrl: String): AppUpdateInfo? {
+        val now = System.currentTimeMillis()
+        if (now - lastGithubCheckTime < 8_000L && cachedGithubUpdateInfo != null) {
+            return cachedGithubUpdateInfo
+        }
+
         try {
             // Extract owner and repo: github.com/{owner}/{repo}
             val match = Regex("""github\.com/([^/]+)/([^/\s#?]+)""", RegexOption.IGNORE_CASE).find(rawGithubUrl)
@@ -972,113 +1027,170 @@ object CloudDriveServerManager {
             val owner = match.groupValues[1]
             val repo = match.groupValues[2].removeSuffix(".git")
 
-            // 1. Try GitHub Releases API
-            val apiUrl = "https://api.github.com/repos/$owner/$repo/releases"
-            try {
-                val req = Request.Builder()
-                    .url(apiUrl)
-                    .header("User-Agent", USER_AGENT)
-                    .header("Accept", "application/vnd.github.v3+json")
-                    .header("Cache-Control", "no-cache")
-                    .header("Pragma", "no-cache")
-                    .get()
-                    .build()
-                val res = httpClient.newCall(req).execute()
-                if (res.isSuccessful) {
-                    val body = res.body?.string() ?: ""
-                    res.close()
-                    val array = JSONArray(body)
-                    if (array.length() > 0) {
-                        for (i in 0 until array.length()) {
-                            val releaseObj = array.getJSONObject(i)
+            // 1. Try GitHub Releases API (latest release first, then all releases)
+            val apiEndpoints = listOf(
+                "https://api.github.com/repos/$owner/$repo/releases/latest",
+                "https://api.github.com/repos/$owner/$repo/releases"
+            )
+
+            for (apiUrl in apiEndpoints) {
+                try {
+                    val req = Request.Builder()
+                        .url(apiUrl)
+                        .header("User-Agent", USER_AGENT)
+                        .header("Accept", "application/vnd.github.v3+json")
+                        .header("Cache-Control", "no-cache")
+                        .header("Pragma", "no-cache")
+                        .get()
+                        .build()
+                    val res = httpClient.newCall(req).execute()
+                    if (res.isSuccessful) {
+                        val body = res.body?.string()?.trim() ?: ""
+                        res.close()
+                        if (body.startsWith("{")) {
+                            val releaseObj = JSONObject(body)
                             val assets = releaseObj.optJSONArray("assets") ?: JSONArray()
-                            for (j in 0 until assets.length()) {
-                                val asset = assets.getJSONObject(j)
-                                val aName = asset.optString("name", "")
-                                val aDownloadUrl = asset.optString("browser_download_url", "")
-                                val aSize = asset.optLong("size", 0L)
-                                val aUpdated = asset.optString("updated_at", "")
-                                val aId = asset.optLong("id", 0L)
-                                if (aName.endsWith(".apk", ignoreCase = true) || aDownloadUrl.endsWith(".apk", ignoreCase = true) || aName.contains("app", ignoreCase = true)) {
-                                    val timeMillis = try {
-                                        java.time.Instant.parse(aUpdated).toEpochMilli()
-                                    } catch (_: Exception) {
-                                        try {
-                                            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
-                                            sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
-                                            sdf.parse(aUpdated.replace("Z", ""))?.time ?: 0L
-                                        } catch (_: Exception) {
-                                            0L
-                                        }
-                                    }
-                                    val safeTime = if (timeMillis > 0L) timeMillis else Math.abs("gh_${aId}_${aUpdated}_${aSize}".hashCode().toLong()).coerceAtLeast(1L)
-                                    val stableFileId = "gh_${owner}_${repo}_${aId}_${aSize}"
-                                    return AppUpdateInfo(
-                                        hasUpdate = true,
-                                        fileId = stableFileId,
-                                        fileName = aName.ifBlank { "KingoKing_Update.apk" },
-                                        updatedAtMillis = safeTime,
-                                        fileSize = aSize,
-                                        downloadUrl = aDownloadUrl
-                                    )
+                            val info = extractApkFromAssets(owner, repo, assets)
+                            if (info != null) {
+                                cachedGithubUpdateInfo = info
+                                lastGithubCheckTime = System.currentTimeMillis()
+                                return info
+                            }
+                        } else if (body.startsWith("[")) {
+                            val array = JSONArray(body)
+                            for (i in 0 until array.length()) {
+                                val releaseObj = array.getJSONObject(i)
+                                val assets = releaseObj.optJSONArray("assets") ?: JSONArray()
+                                val info = extractApkFromAssets(owner, repo, assets)
+                                if (info != null) {
+                                    cachedGithubUpdateInfo = info
+                                    lastGithubCheckTime = System.currentTimeMillis()
+                                    return info
                                 }
                             }
                         }
+                    } else {
+                        res.close()
                     }
-                } else {
-                    res.close()
-                }
-            } catch (_: Exception) {}
+                } catch (_: Exception) {}
+            }
 
-            // 2. Direct HTTP HEAD check on the direct release asset download URL
+            // 2. Direct HTTP check on the direct release asset download URL & releases web page
             val directDownloadUrl = DataStoreManager.normalizeAppDownloadUrl(rawGithubUrl)
+            var extractedTime = 0L
+            var contentLength = 0L
+            var etag = ""
+
             try {
                 val headReq = Request.Builder()
                     .url(directDownloadUrl)
                     .header("User-Agent", USER_AGENT)
                     .header("Accept", "*/*")
-                    .header("Range", "bytes=0-1024")
-                    .header("Cache-Control", "no-cache")
+                    .header("Cache-Control", "no-cache, no-store")
                     .header("Pragma", "no-cache")
                     .get()
                     .build()
                 val headRes = httpClient.newCall(headReq).execute()
                 val lastMod = headRes.header("Last-Modified")
-                val etag = headRes.header("ETag") ?: ""
-                val clen = headRes.header("Content-Length")?.toLongOrNull() ?: 0L
+                val creation = headRes.header("x-ms-creation-time")
+                etag = headRes.header("ETag") ?: ""
+                contentLength = headRes.header("Content-Length")?.toLongOrNull() ?: 0L
                 headRes.close()
 
-                val timeMillis = if (!lastMod.isNullOrBlank()) {
+                val timeHeader = lastMod ?: creation
+                if (!timeHeader.isNullOrBlank()) {
                     try {
-                        java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", java.util.Locale.US).parse(lastMod)?.time ?: 0L
-                    } catch (_: Exception) { 0L }
-                } else 0L
-
-                val hashKey = "${directDownloadUrl}_${etag}_${clen}_${lastMod}"
-                val stableTime = if (timeMillis > 0L) timeMillis else Math.abs(hashKey.hashCode().toLong()).coerceAtLeast(1L)
-                val syntheticStamp = Math.abs(hashKey.hashCode().toLong()).coerceAtLeast(1L)
-                return AppUpdateInfo(
-                    hasUpdate = true,
-                    fileId = "gh_head_${syntheticStamp}",
-                    fileName = "KingoKing_Update.apk",
-                    updatedAtMillis = stableTime,
-                    fileSize = clen,
-                    downloadUrl = directDownloadUrl
-                )
+                        extractedTime = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss z", java.util.Locale.US).parse(timeHeader)?.time ?: 0L
+                    } catch (_: Exception) {}
+                }
             } catch (_: Exception) {}
 
-            val stableFallbackId = Math.abs(directDownloadUrl.hashCode().toLong()).coerceAtLeast(1L)
-            return AppUpdateInfo(
+            // 3. Fallback: Parse GitHub public releases HTML web page (not subject to API rate limits!)
+            if (extractedTime == 0L) {
+                try {
+                    val pageUrl = "https://github.com/$owner/$repo/releases"
+                    val pageReq = Request.Builder()
+                        .url(pageUrl)
+                        .header("User-Agent", USER_AGENT)
+                        .header("Accept", "text/html")
+                        .header("Cache-Control", "no-cache, no-store")
+                        .header("Pragma", "no-cache")
+                        .get()
+                        .build()
+                    val pageRes = httpClient.newCall(pageReq).execute()
+                    if (pageRes.isSuccessful) {
+                        val html = pageRes.body?.string() ?: ""
+                        pageRes.close()
+                        val timeRegex = Regex("""(?:datetime|data-date)=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        val matchTime = timeRegex.find(html)
+                        if (matchTime != null) {
+                            val timeStr = matchTime.groupValues[1]
+                            extractedTime = try {
+                                java.time.Instant.parse(timeStr).toEpochMilli()
+                            } catch (_: Exception) {
+                                val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
+                                sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                                sdf.parse(timeStr.replace("Z", ""))?.time ?: 0L
+                            }
+                        }
+                    } else {
+                        pageRes.close()
+                    }
+                } catch (_: Exception) {}
+            }
+
+            val hashKey = "${directDownloadUrl}_${etag}_${contentLength}_${extractedTime}"
+            val safeTime = if (extractedTime > 0L) extractedTime else Math.abs(hashKey.hashCode().toLong()).coerceAtLeast(1L)
+            val stableFileId = "gh_${owner}_${repo}_${etag.take(12)}_${contentLength}_${safeTime}"
+            val info = AppUpdateInfo(
                 hasUpdate = true,
-                fileId = "gh_url_${stableFallbackId}",
+                fileId = stableFileId,
                 fileName = "KingoKing_Update.apk",
-                updatedAtMillis = stableFallbackId,
-                fileSize = 0L,
+                updatedAtMillis = safeTime,
+                fileSize = contentLength,
                 downloadUrl = directDownloadUrl
             )
+            cachedGithubUpdateInfo = info
+            lastGithubCheckTime = System.currentTimeMillis()
+            return info
         } catch (_: Exception) {
             return null
         }
+    }
+
+    private fun extractApkFromAssets(owner: String, repo: String, assets: JSONArray): AppUpdateInfo? {
+        for (j in 0 until assets.length()) {
+            val asset = assets.getJSONObject(j)
+            val aName = asset.optString("name", "")
+            val aDownloadUrl = asset.optString("browser_download_url", "")
+            val aSize = asset.optLong("size", 0L)
+            val aUpdated = asset.optString("updated_at", "").ifBlank { asset.optString("created_at", "") }
+            val aId = asset.optLong("id", 0L)
+            if (aName.endsWith(".apk", ignoreCase = true) || aDownloadUrl.endsWith(".apk", ignoreCase = true) || aName.contains("app", ignoreCase = true)) {
+                val timeMillis = try {
+                    java.time.Instant.parse(aUpdated).toEpochMilli()
+                } catch (_: Exception) {
+                    try {
+                        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
+                        sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                        sdf.parse(aUpdated.replace("Z", ""))?.time ?: 0L
+                    } catch (_: Exception) {
+                        0L
+                    }
+                }
+                val safeTime = if (timeMillis > 0L) timeMillis else Math.abs("gh_${aId}_${aUpdated}_${aSize}".hashCode().toLong()).coerceAtLeast(1L)
+                val stableFileId = "gh_${owner}_${repo}_${aId}_${aSize}_${safeTime}"
+                return AppUpdateInfo(
+                    hasUpdate = true,
+                    fileId = stableFileId,
+                    fileName = aName.ifBlank { "KingoKing_Update.apk" },
+                    updatedAtMillis = safeTime,
+                    fileSize = aSize,
+                    downloadUrl = aDownloadUrl
+                )
+            }
+        }
+        return null
     }
 
     /**

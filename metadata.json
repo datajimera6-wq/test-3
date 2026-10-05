@@ -1,6 +1,6 @@
 {
-  "name": "Remix Remix my-3",
-  "description": "Imported from GitHub: datajimera7-collab/my-1",
+  "name": "Kingo King",
+  "description": "Watch and earn rewards with automated video task discovery and progress tracking.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

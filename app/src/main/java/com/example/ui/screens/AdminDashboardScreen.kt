@@ -1894,14 +1894,14 @@ private fun GoogleDriveServerTabContent(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Full Screen YouTube Opening Overlay",
+                        text = "Full Screen Opening / Floating Pill Toggle",
                         fontWeight = FontWeight.Bold,
                         style = MaterialTheme.typography.titleSmall,
                         color = PrimaryBlue
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "ON: YouTube open hone par 'Opening...' ka overlay poori screen par full-screen size mein aayega. OFF: Chhota bottom pill dikhega.",
+                        text = "ON: Video play time par upar ka chhota floating pill hide rahega, sirf neeche ka suggested lock bar active rahega. OFF: Video ke upar chhota floating timer pill bhi dikhega.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 16.sp

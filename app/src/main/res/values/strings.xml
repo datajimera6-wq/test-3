@@ -1,4 +1,5 @@
 <resources>
+    <string name="app_name">Kingo King</string>
     <string name="app_tagline">Sit Back - Watch &amp; Earn</string>
     <string name="accessibility_service_description">Automates human-like typing and search in YouTube to locate and click target task videos hands-free.</string>
 </resources>

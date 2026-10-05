@@ -349,8 +349,8 @@ object NotificationChannels {
                             newlyNotifiedKeys.add(updKey)
                             sendAdminUpdateNotification(
                                 context = context,
-                                title = "🚀 App Update Available",
-                                body = "Tap to download the latest update.",
+                                title = "🚀 Kingo King Update Available",
+                                body = "Naya update aa gaya hai! Tap karke turant app update karein.",
                                 dedupKey = updKey,
                                 targetScreen = "home"
                             )

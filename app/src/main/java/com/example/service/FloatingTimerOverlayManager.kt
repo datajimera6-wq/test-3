@@ -30,6 +30,7 @@ import com.example.util.TimeFormatter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -84,6 +85,33 @@ class FloatingTimerOverlayManager(private val context: Context) {
     private var suggestedLockProgressFillView: View? = null
     private var suggestedLockStatusTagView: TextView? = null
 
+    private var isOpeningOverlayEnabled: Boolean = true
+
+    init {
+        overlayScope.launch {
+            dataStoreManager.fullScreenOpeningOverlayFlow.collectLatest { enabled ->
+                isOpeningOverlayEnabled = enabled
+                runOnMain {
+                    if (isAttached && WatchSessionRepository.sessionState.value == com.example.data.SessionState.ACTIVE) {
+                        if (enabled) {
+                            // When admin Opening toggle is ON: Hide top timer pill, keep only bottom lock bar!
+                            overlayRootView?.let { v ->
+                                try { windowManager.removeView(v) } catch (_: Exception) {}
+                                globalAttachedViews.remove(v)
+                            }
+                            overlayRootView = null
+                        } else {
+                            // When admin Opening toggle is OFF: Show top timer pill!
+                            if (overlayRootView == null) {
+                                showOverlay()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Player drag-down / swipe-down freeze lock overlay
     private var playerLockRootView: FrameLayout? = null
 
@@ -130,6 +158,19 @@ class FloatingTimerOverlayManager(private val context: Context) {
         }
     }
 
+    private fun isOpeningToggleOn(): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences("watchearn_prefs", Context.MODE_PRIVATE)
+            if (prefs.contains("full_screen_opening_overlay")) {
+                prefs.getBoolean("full_screen_opening_overlay", true)
+            } else {
+                isOpeningOverlayEnabled
+            }
+        } catch (_: Exception) {
+            isOpeningOverlayEnabled
+        }
+    }
+
     @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
     fun showOverlay() {
         runOnMain {
@@ -139,23 +180,6 @@ class FloatingTimerOverlayManager(private val context: Context) {
                 return@runOnMain
             }
 
-            // If already attached and active, do not recreate or duplicate the overlay
-            if (isAttached && overlayRootView != null && incompletePopupView == null) {
-                return@runOnMain
-            }
-
-            // Guarantee no stale or duplicate overlay views exist in WindowManager
-            removeAllGlobalViews(windowManager)
-            overlayRootView?.let {
-                try { windowManager.removeView(it) } catch (_: Exception) {}
-            }
-            incompletePopupView?.let {
-                try { windowManager.removeView(it) } catch (_: Exception) {}
-            }
-            overlayRootView = null
-            incompletePopupView = null
-            isAttached = false
-
             if (!Settings.canDrawOverlays(context)) {
                 WatchSessionRepository.addLog(
                     "Floating timer overlay not displayed: 'Display over other apps' permission required.",
@@ -163,6 +187,42 @@ class FloatingTimerOverlayManager(private val context: Context) {
                 )
                 return@runOnMain
             }
+
+            // Always lock the suggested videos section below the comments and freeze player drag
+            showSuggestedVideosLockOverlay()
+            showPlayerDragLockOverlay()
+            registerSessionCallbacks()
+            isAttached = true
+
+            // Admin toggle control:
+            // ON (default): Target video play time par upar chhota overlay pill hide rahega, only bottom lock bar rahega!
+            // OFF: Target video play time par upar chhota timer pill bhi dikhega!
+            val isOpeningOn = isOpeningToggleOn()
+            if (isOpeningOn) {
+                overlayRootView?.let {
+                    try { windowManager.removeView(it) } catch (_: Exception) {}
+                    globalAttachedViews.remove(it)
+                }
+                overlayRootView = null
+                WatchSessionRepository.addLog("Top timer pill hidden (Admin Opening toggle is ON), bottom suggested lock active", LogType.INFO)
+                return@runOnMain
+            }
+
+            // If already attached and active, do not recreate or duplicate the overlay
+            if (overlayRootView != null && incompletePopupView == null) {
+                return@runOnMain
+            }
+
+            overlayRootView?.let {
+                try { windowManager.removeView(it) } catch (_: Exception) {}
+                globalAttachedViews.remove(it)
+            }
+            incompletePopupView?.let {
+                try { windowManager.removeView(it) } catch (_: Exception) {}
+                globalAttachedViews.remove(it)
+            }
+            overlayRootView = null
+            incompletePopupView = null
 
             density = context.resources.displayMetrics.density
             val hudWidthPx = (242 * density).toInt()
@@ -499,59 +559,57 @@ class FloatingTimerOverlayManager(private val context: Context) {
                 WatchSessionRepository.addLog("Failed to add floating timer: ${e.message}", LogType.ERROR)
             }
 
-            // Hook live auto-detection listeners from accessibility & repository
-            WatchSessionRepository.onTaskLikeDetected = {
-                handleLikeDetected()
-            }
-            WatchSessionRepository.onVideoAlreadyLikedDetected = { _ ->
-                // If video was already liked prior to this watch session, mark badge without awarding duplicate coins
-                val activeId = WatchSessionRepository.activeTaskId.value ?: "default_task"
-                overlayScope.launch {
-                    dataStoreManager.markTaskAlreadyLiked(activeId)
-                    runOnMain {
-                        isTaskLiked = true
-                        applyLikedBadgeStyle()
-                    }
-                }
-            }
-            WatchSessionRepository.onTaskCommentDetected = {
-                handleCommentDetected()
-            }
-            WatchSessionRepository.onCommentSheetVisibilityChanged = { isOpen ->
-                runOnMain { setSuggestedLockVisible(!isOpen) }
-            }
-            WatchSessionRepository.onRequestHideOverlay = {
-                hideOverlay()
-            }
-            WatchSessionRepository.onRequestShowOverlay = {
-                showOverlay()
-            }
+            registerSessionCallbacks()
+        }
+    }
 
-            // Check if active task is already liked or commented
+    private fun registerSessionCallbacks() {
+        // Hook live auto-detection listeners from accessibility & repository
+        WatchSessionRepository.onTaskLikeDetected = {
+            handleLikeDetected()
+        }
+        WatchSessionRepository.onVideoAlreadyLikedDetected = { _ ->
+            // If video was already liked prior to this watch session, mark badge without awarding duplicate coins
             val activeId = WatchSessionRepository.activeTaskId.value ?: "default_task"
             overlayScope.launch {
-                try {
-                    val likedSet = dataStoreManager.likedTasksFlow.first()
-                    val alreadyLiked = likedSet.contains(activeId)
-                    val commentMap = dataStoreManager.commentCountsFlow.first()
-                    val cCount = commentMap[activeId] ?: 0
-
-                    runOnMain {
-                        isTaskLiked = alreadyLiked
-                        if (alreadyLiked) {
-                            applyLikedBadgeStyle()
-                        }
-                        currentCommentCount = cCount
-                        updateCommentBadge()
-                    }
-                } catch (_: Exception) {}
+                dataStoreManager.markTaskAlreadyLiked(activeId)
+                runOnMain {
+                    isTaskLiked = true
+                    applyLikedBadgeStyle()
+                }
             }
+        }
+        WatchSessionRepository.onTaskCommentDetected = {
+            handleCommentDetected()
+        }
+        WatchSessionRepository.onCommentSheetVisibilityChanged = { isOpen ->
+            runOnMain { setSuggestedLockVisible(!isOpen) }
+        }
+        WatchSessionRepository.onRequestHideOverlay = {
+            hideOverlay()
+        }
+        WatchSessionRepository.onRequestShowOverlay = {
+            showOverlay()
+        }
 
-            // Lock the suggested videos section below the comments so it cannot be clicked or scrolled
-            showSuggestedVideosLockOverlay()
+        // Check if active task is already liked or commented
+        val activeId = WatchSessionRepository.activeTaskId.value ?: "default_task"
+        overlayScope.launch {
+            try {
+                val likedSet = dataStoreManager.likedTasksFlow.first()
+                val alreadyLiked = likedSet.contains(activeId)
+                val commentMap = dataStoreManager.commentCountsFlow.first()
+                val cCount = commentMap[activeId] ?: 0
 
-            // Lock the video player area at top to prevent dragging down or minimizing the video
-            showPlayerDragLockOverlay()
+                runOnMain {
+                    isTaskLiked = alreadyLiked
+                    if (alreadyLiked) {
+                        applyLikedBadgeStyle()
+                    }
+                    currentCommentCount = cCount
+                    updateCommentBadge()
+                }
+            } catch (_: Exception) {}
         }
     }
 
@@ -649,14 +707,27 @@ class FloatingTimerOverlayManager(private val context: Context) {
         }
         suggestedLockRootView = null
 
-        val screenHeight = context.resources.displayMetrics.heightPixels.coerceAtLeast(800)
         val density = context.resources.displayMetrics.density
-        // Suggested videos section occupies the bottom ~54% of the screen under comments and actions
-        val lockHeightPx = (screenHeight * 0.54f).toInt().coerceAtLeast((360 * density).toInt())
+        val realMetrics = android.util.DisplayMetrics()
+        val realScreenHeight = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                windowManager.currentWindowMetrics.bounds.height()
+            } catch (_: Exception) {
+                context.resources.displayMetrics.heightPixels
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            try {
+                windowManager.defaultDisplay.getRealMetrics(realMetrics)
+                realMetrics.heightPixels
+            } catch (_: Exception) {
+                context.resources.displayMetrics.heightPixels
+            }
+        }.coerceAtLeast(800)
 
         val lockParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            lockHeightPx,
+            WindowManager.LayoutParams.WRAP_CONTENT,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
@@ -668,9 +739,12 @@ class FloatingTimerOverlayManager(private val context: Context) {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = 0
         }
 
         val root = FrameLayout(context).apply {
+            // Transparent container so only the styled lock card is rendered without any blank filler
+            setBackgroundColor(Color.TRANSPARENT)
             // Absolute Lock: Intercept & consume 100% of touches, scrolls, and clicks so underlying YouTube suggestions are completely locked!
             setOnTouchListener { _, event ->
                 if (event.action == MotionEvent.ACTION_UP) {
@@ -691,13 +765,13 @@ class FloatingTimerOverlayManager(private val context: Context) {
             gravity = Gravity.CENTER_HORIZONTAL
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+                FrameLayout.LayoutParams.WRAP_CONTENT
             )
             setPadding(
                 (18 * density).toInt(),
                 (14 * density).toInt(),
                 (18 * density).toInt(),
-                (14 * density).toInt()
+                (16 * density).toInt()
             )
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
@@ -948,6 +1022,7 @@ class FloatingTimerOverlayManager(private val context: Context) {
         infoCard.addView(rewardRow)
 
         cardLayout.addView(infoCard)
+
         root.addView(cardLayout)
 
         try {
@@ -1042,7 +1117,7 @@ class FloatingTimerOverlayManager(private val context: Context) {
         }
     }
 
-    fun isOverlayAttached(): Boolean = isAttached
+    fun isOverlayAttached(): Boolean = isAttached && (overlayRootView != null || suggestedLockRootView != null)
 
     @SuppressLint("SetTextI18n")
     fun updateProgress(

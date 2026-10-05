@@ -139,7 +139,9 @@ object ApkUpdateInstaller {
 
     /**
      * Determines whether the currently running app is already up-to-date with respect to the remote update.
-     * Prevents false "Mandatory Update" dialogs when user downloads the latest app via referral link.
+     * Compares remote upload timestamp against this app's package install/update time:
+     * - If remote APK was uploaded AFTER user installed this app -> update is required!
+     * - If user installed this app AFTER or at the release timestamp -> already up to date!
      */
     fun isAppAlreadyUpToDate(
         context: Context,
@@ -147,11 +149,28 @@ object ApkUpdateInstaller {
         installedSignature: String = ""
     ): Boolean {
         if (!updateInfo.hasUpdate) return true
-        if (installedSignature.isNotBlank() && installedSignature == updateInfo.signature) {
+
+        if (didAppUpdateComplete(context, updateInfo)) {
             return true
         }
 
-        if (didAppUpdateComplete(context, updateInfo)) {
+        try {
+            val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            val appInstallTime = Math.max(pkgInfo.firstInstallTime, pkgInfo.lastUpdateTime)
+
+            // When a remote upload timestamp is available, compare directly with the app's install timestamp
+            if (updateInfo.updatedAtMillis > 0L) {
+                // If remote file was uploaded after this app was installed/updated on device:
+                if (updateInfo.updatedAtMillis > appInstallTime) {
+                    return false
+                } else {
+                    // App was installed after this release was published -> user already has latest version!
+                    return true
+                }
+            }
+        } catch (_: Exception) {}
+
+        if (installedSignature.isNotBlank() && installedSignature == updateInfo.signature) {
             return true
         }
 

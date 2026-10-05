@@ -27,6 +27,7 @@ import com.example.data.PayoutStatus
 import com.example.data.PayoutRequest
 import com.example.data.WatchDurationTier
 import com.example.data.WATCH_DURATION_TIERS
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -426,6 +427,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (_: Exception) {}
                 }
                 delay(1_000L)
+            }
+        }
+
+        // Direct GitHub / Remote APK Update Checker (checks every 8s)
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                try {
+                    val appDlUrl = dataStoreManager.appDownloadUrlFlow.first().ifBlank { DataStoreManager.DEFAULT_APP_DOWNLOAD_URL }
+                    if (appDlUrl.isNotBlank()) {
+                        val upd = com.example.admin.CloudDriveServerManager.inspectPublicDriveUpdateLink(appDlUrl)
+                        if (upd != null && upd.hasUpdate) {
+                            dataStoreManager.saveRemoteAppUpdate(upd)
+                        }
+                    }
+                } catch (_: Exception) {}
+                delay(8_000L)
             }
         }
 

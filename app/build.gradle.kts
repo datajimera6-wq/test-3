@@ -13,29 +13,16 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
+    applicationId = "com.example.kingo.rfumiv"
     minSdk = 26
     targetSdk = 36
     val autoVersionCode = ((System.currentTimeMillis() / 60000L) - 29000000L).toInt().coerceAtLeast(10)
     versionCode = autoVersionCode
     versionName = "2.0.$autoVersionCode"
 
-    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-  }
+    buildConfigField("String", "APP_ROLE", "\"USER\"")
 
-  flavorDimensions += "role"
-  productFlavors {
-    create("admin") {
-      dimension = "role"
-      applicationId = "com.example.kingo.rfumiv"
-      resValue("string", "app_name", "Kingo Admin")
-      buildConfigField("String", "APP_ROLE", "\"ADMIN\"")
-    }
-    create("user") {
-      dimension = "role"
-      applicationId = "com.example.kingo.rfumiv"
-      resValue("string", "app_name", "Kingo King")
-      buildConfigField("String", "APP_ROLE", "\"USER\"")
-    }
+    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
   signingConfigs {
@@ -79,16 +66,6 @@ android {
   }
 }
 
-// Ensure any leftover src/admin/java or src/user/java directories are removed so all Kotlin code compiles cleanly from src/main, while keeping flavor-specific res/ icons intact
-listOf(
-  "src/admin/java",
-  "src/user/java"
-).forEach { relativePath ->
-  val target = file(relativePath)
-  if (target.exists()) {
-    target.deleteRecursively()
-  }
-}
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
